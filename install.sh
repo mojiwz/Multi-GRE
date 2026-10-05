@@ -528,7 +528,7 @@ create_gre() {
         details="$(
             ip -d link show "$INTERFACE" 2>/dev/null ||
                 true
-        )
+        )"
 
         if ! grep -qF "remote ${REMOTE_PUBLIC}" <<< "$details" ||
            ! grep -qF "local ${LOCAL_PUBLIC}" <<< "$details"
