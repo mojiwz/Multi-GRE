@@ -36,4 +36,4 @@ Supported package managers:
 Run as root:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/USERNAME/vatan-gre/main/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/mojiwz/Multi-GRE/refs/heads/main/install.sh)
