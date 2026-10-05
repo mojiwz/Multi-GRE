@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="3.1.0"
+VERSION="3.1.1"
 
 BASE="/etc/picaso"
 TUNNELS="$BASE/tunnels"
@@ -21,11 +21,11 @@ SYSCTL_FORWARD="/etc/sysctl.d/99-picaso-forwarding.conf"
 SYSCTL_BBR="/etc/sysctl.d/99-picaso-bbr.conf"
 SYSCTL_NET="/etc/sysctl.d/99-picaso-network.conf"
 
-C='\033[0;36m'
-G='\033[0;32m'
-Y='\033[1;33m'
-R='\033[0;31m'
-X='\033[0m'
+C=$'\033[0;36m'
+G=$'\033[0;32m'
+Y=$'\033[1;33m'
+R=$'\033[0;31m'
+X=$'\033[0m'
 
 
 # ============================================================
@@ -77,15 +77,26 @@ trap 'rc=$?; err "Failed at line $LINENO: $BASH_COMMAND (exit $rc)"; exit $rc' E
 # ============================================================
 
 require_root() {
-    [[ "$EUID" -eq 0 ]] || die "Run this script as root."
+    [[ "$EUID" -eq 0 ]] ||
+        die "Run this script as root."
 }
 
 
 install_missing() {
 
     local -a missing=()
+    local cmd
 
-    for cmd in ip iptables systemctl awk sed grep ping sysctl; do
+    for cmd in \
+        ip \
+        iptables \
+        systemctl \
+        awk \
+        sed \
+        grep \
+        ping \
+        sysctl
+    do
         if ! command -v "$cmd" >/dev/null 2>&1; then
             missing+=("$cmd")
         fi
@@ -95,16 +106,16 @@ install_missing() {
         return 0
     fi
 
-    command -v apt-get >/dev/null 2>&1 || {
+    command -v apt-get >/dev/null 2>&1 ||
         die "Missing commands: ${missing[*]}. Install iproute2 iptables iputils-ping procps."
-    }
 
-    info "Required packages are missing."
-    info "Installing: iproute2 iptables iputils-ping procps"
+    info "Installing required packages:"
+    info "iproute2 iptables iputils-ping procps"
 
     export DEBIAN_FRONTEND=noninteractive
 
     apt-get update
+
     apt-get install -y \
         iproute2 \
         iptables \
@@ -139,13 +150,18 @@ require_commands() {
 
 init() {
 
-    mkdir -p "$BASE"
-    mkdir -p "$TUNNELS"
-    mkdir -p "$PORTS"
+    mkdir -p \
+        "$BASE" \
+        "$TUNNELS" \
+        "$PORTS"
 
     touch "$LOG"
 
-    chmod 700 "$BASE" "$TUNNELS" "$PORTS" 2>/dev/null || true
+    chmod 700 \
+        "$BASE" \
+        "$TUNNELS" \
+        "$PORTS" \
+        2>/dev/null || true
 
     if [[ ! -f "$STATE" ]]; then
         echo "1" > "$STATE"
@@ -176,6 +192,7 @@ valid_ipv4() {
     ((d <= 255))
 }
 
+
 valid_port() {
 
     local port="$1"
@@ -184,6 +201,7 @@ valid_port() {
 
     ((port >= 1 && port <= 65535))
 }
+
 
 valid_proto() {
 
@@ -197,11 +215,12 @@ valid_proto() {
     esac
 }
 
+
 valid_id() {
 
     [[ "$1" =~ ^[1-9][0-9]*$ ]] || return 1
 
-    (( "$1" <= 100000 ))
+    ((10#$1 <= 100000))
 }
 
 
@@ -227,11 +246,12 @@ detect_public_ip() {
 
         ip="$(
             ip -4 addr show dev "$wan" scope global 2>/dev/null |
-            awk '/inet / {
-                sub("/.*","",$2)
-                print $2
-                exit
-            }' || true
+                awk '/inet / {
+                    sub("/.*", "", $2)
+                    print $2
+                    exit
+                }' ||
+                true
         )"
 
         if valid_ipv4 "$ip"; then
@@ -240,16 +260,18 @@ detect_public_ip() {
         fi
     fi
 
+
     ip="$(
         ip -4 route get 1.1.1.1 2>/dev/null |
-        awk '{
-            for (i=1;i<=NF;i++) {
-                if ($i=="src") {
-                    print $(i+1)
-                    exit
+            awk '{
+                for (i = 1; i <= NF; i++) {
+                    if ($i == "src") {
+                        print $(i + 1)
+                        exit
+                    }
                 }
-            }
-        }' || true
+            }' ||
+            true
     )"
 
     if valid_ipv4 "$ip"; then
@@ -308,8 +330,8 @@ reserve_manual_id() {
 
     [[ "$next" =~ ^[0-9]+$ ]] || next=1
 
-    if ((id >= next)); then
-        echo $((id + 1)) > "$STATE"
+    if ((10#$id >= 10#$next)); then
+        echo $((10#$id + 1)) > "$STATE"
     fi
 }
 
@@ -321,9 +343,12 @@ reserve_manual_id() {
 subnet_for_id() {
 
     local id="$1"
-    local index=$((id - 1))
-    local second=$((index / 64))
-    local block=$((index % 64))
+    local index=$((10#$id - 1))
+    local second
+    local block
+
+    second=$((index / 64))
+    block=$((index % 64))
 
     ((second <= 255)) ||
         die "Tunnel ID is too large."
@@ -406,6 +431,18 @@ iface_exists() {
 
 
 # ============================================================
+# IPTABLES HELPERS
+# ============================================================
+
+delete_rule() {
+
+    while iptables "$@" 2>/dev/null; do
+        :
+    done
+}
+
+
+# ============================================================
 # GRE FIREWALL
 # ============================================================
 
@@ -419,7 +456,8 @@ gre_fw_add() {
         -s "$remote_public" \
         -m comment \
         --comment "PICASO GRE $iface" \
-        -j ACCEPT 2>/dev/null
+        -j ACCEPT \
+        2>/dev/null
     then
 
         iptables -I INPUT 1 \
@@ -435,7 +473,8 @@ gre_fw_add() {
         -i "$iface" \
         -m comment \
         --comment "PICASO TUNNEL $iface" \
-        -j ACCEPT 2>/dev/null
+        -j ACCEPT \
+        2>/dev/null
     then
 
         iptables -I INPUT 1 \
@@ -444,14 +483,6 @@ gre_fw_add() {
             --comment "PICASO TUNNEL $iface" \
             -j ACCEPT
     fi
-}
-
-
-delete_rule() {
-
-    while iptables "$@" 2>/dev/null; do
-        :
-    done
 }
 
 
@@ -484,6 +515,7 @@ gre_fw_del() {
 create_gre() {
 
     local id="$1"
+    local details
 
     load_cfg "$id" ||
         die "Tunnel $id not found."
@@ -493,14 +525,13 @@ create_gre() {
 
     if iface_exists "$INTERFACE"; then
 
-        local details
-
         details="$(
-            ip -d link show "$INTERFACE" 2>/dev/null || true
+            ip -d link show "$INTERFACE" 2>/dev/null ||
+                true
         )
 
-        if ! grep -q "remote ${REMOTE_PUBLIC}" <<< "$details" ||
-           ! grep -q "local ${LOCAL_PUBLIC}" <<< "$details"
+        if ! grep -qF "remote ${REMOTE_PUBLIC}" <<< "$details" ||
+           ! grep -qF "local ${LOCAL_PUBLIC}" <<< "$details"
         then
 
             warn "${INTERFACE} exists with different endpoints."
@@ -522,11 +553,12 @@ create_gre() {
 
 
     ip link set "$INTERFACE" mtu "$MTU"
+
     ip link set "$INTERFACE" up
 
 
     if ! ip addr show dev "$INTERFACE" |
-        grep -q "inet ${LOCAL_TUNNEL}/"
+        grep -qF "inet ${LOCAL_TUNNEL}/"
     then
 
         ip addr add \
@@ -551,8 +583,14 @@ delete_iface() {
     local iface="$1"
 
     if iface_exists "$iface"; then
-        ip link set "$iface" down 2>/dev/null || true
-        ip tunnel del "$iface" 2>/dev/null || true
+
+        ip link set "$iface" down \
+            2>/dev/null ||
+            true
+
+        ip tunnel del "$iface" \
+            2>/dev/null ||
+            true
     fi
 }
 
@@ -565,9 +603,9 @@ enable_forwarding() {
 
     sysctl -w net.ipv4.ip_forward=1 >/dev/null
 
-    cat > "$SYSCTL_FORWARD" <<EOF
-net.ipv4.ip_forward=1
-EOF
+    printf '%s\n' \
+        'net.ipv4.ip_forward=1' \
+        > "$SYSCTL_FORWARD"
 }
 
 
@@ -584,7 +622,8 @@ rule_exists() {
 
     grep -Fxq \
         "${proto}|${public_port}|${destination_port}" \
-        "$PORTS/${id}.rules" 2>/dev/null
+        "$PORTS/${id}.rules" \
+        2>/dev/null
 }
 
 
@@ -595,19 +634,22 @@ port_conflict() {
     local public_port="$3"
 
     local file
-    local p a b c
+    local a b c
 
     for file in "$PORTS"/*.rules; do
 
         [[ -f "$file" ]] || continue
 
-        [[ "$file" == "$PORTS/${id}.rules" ]] && continue
+        [[ "$file" == "$PORTS/${id}.rules" ]] &&
+            continue
 
         while IFS='|' read -r a b c; do
 
-            [[ "$a" == "$proto" &&
-               "$b" == "$public_port" ]] &&
+            if [[ "$a" == "$proto" &&
+                  "$b" == "$public_port" ]]
+            then
                 return 0
+            fi
 
         done < "$file"
     done
@@ -624,22 +666,23 @@ flush_port_rules() {
 
     local id="$1"
 
-    load_cfg "$id" || return 0
+    load_cfg "$id" ||
+        return 0
 
     local file="$PORTS/${id}.rules"
     local wan
 
-    [[ -f "$file" ]] || return 0
+    [[ -f "$file" ]] ||
+        return 0
 
-    wan="$(wan_iface)"
+    wan="$(wan_iface || true)"
 
-    [[ -n "$wan" ]] || return 0
-
+    [[ -n "$wan" ]] ||
+        return 0
 
     local proto
     local public_port
     local destination_port
-
 
     while IFS='|' read -r \
         proto \
@@ -647,8 +690,11 @@ flush_port_rules() {
         destination_port
     do
 
-        [[ -z "$proto" ]] && continue
-        [[ "$proto" == \#* ]] && continue
+        [[ -n "$proto" ]] ||
+            continue
+
+        [[ "$proto" == \#* ]] &&
+            continue
 
 
         delete_rule \
@@ -714,16 +760,19 @@ apply_ports() {
 
     local id="$1"
 
-    load_cfg "$id" || return 0
+    load_cfg "$id" ||
+        return 0
 
-    [[ "$ROLE" == "IRAN" ]] || return 0
+    [[ "$ROLE" == "IRAN" ]] ||
+        return 0
 
     local file="$PORTS/${id}.rules"
     local wan
 
-    [[ -f "$file" ]] || return 0
+    [[ -f "$file" ]] ||
+        return 0
 
-    wan="$(wan_iface)"
+    wan="$(wan_iface || true)"
 
     [[ -n "$wan" ]] ||
         die "Could not detect WAN interface."
@@ -743,8 +792,11 @@ apply_ports() {
         destination_port
     do
 
-        [[ -z "$proto" ]] && continue
-        [[ "$proto" == \#* ]] && continue
+        [[ -n "$proto" ]] ||
+            continue
+
+        [[ "$proto" == \#* ]] &&
+            continue
 
 
         if ! iptables -t nat -C PREROUTING \
@@ -864,11 +916,14 @@ add_port() {
     local public_port="$3"
     local destination_port="$4"
 
+
     load_cfg "$id" ||
         die "Tunnel not found."
 
+
     [[ "$ROLE" == "IRAN" ]] ||
         die "Port forwarding is configured on the IRAN server."
+
 
     valid_proto "$proto" ||
         die "Invalid protocol."
@@ -888,6 +943,7 @@ add_port() {
     then
 
         warn "This forwarding rule already exists."
+
         return
     fi
 
@@ -924,7 +980,9 @@ remove_port() {
     local public_port="$3"
     local destination_port="$4"
 
-    [[ -f "$PORTS/${id}.rules" ]] || return 0
+
+    [[ -f "$PORTS/${id}.rules" ]] ||
+        return 0
 
 
     sed -i \
@@ -933,6 +991,7 @@ remove_port() {
 
 
     flush_port_rules "$id"
+
     apply_ports "$id"
 
 
@@ -1016,6 +1075,7 @@ restart_tunnel() {
 delete_tunnel() {
 
     local id="$1"
+    local confirm
 
     load_cfg "$id" ||
         die "Tunnel not found."
@@ -1027,8 +1087,8 @@ delete_tunnel() {
 
     read -r -p "Type DELETE to continue: " confirm
 
-    [[ "$confirm" == "DELETE" ]] ||
-    {
+
+    [[ "$confirm" == "DELETE" ]] || {
         warn "Cancelled."
         return
     }
@@ -1062,7 +1122,8 @@ status_tunnel() {
 
     local id="$1"
 
-    load_cfg "$id" || return 1
+    load_cfg "$id" ||
+        return 1
 
 
     if ! iface_exists "$INTERFACE"; then
@@ -1104,6 +1165,7 @@ list_tunnels() {
     local file
 
     printf '\n'
+
     printf '%-4s %-10s %-8s %-16s %-16s %s\n' \
         "ID" \
         "STATUS" \
@@ -1112,12 +1174,27 @@ list_tunnels() {
         "REMOTE_PUBLIC" \
         "INTERFACE"
 
+
     for file in "$TUNNELS"/*.conf; do
 
-        [[ -f "$file" ]] || continue
+        [[ -f "$file" ]] ||
+            continue
+
+        unset \
+            ID \
+            ROLE \
+            LOCAL_PUBLIC \
+            REMOTE_PUBLIC \
+            INTERFACE \
+            LOCAL_TUNNEL \
+            REMOTE_TUNNEL \
+            SUBNET \
+            MTU \
+            ENABLED
 
         # shellcheck disable=SC1090
         source "$file"
+
 
         printf '%-4s %-10s %-8s %-16s %-16s %s\n' \
             "$ID" \
@@ -1126,6 +1203,7 @@ list_tunnels() {
             "$LOCAL_PUBLIC" \
             "$REMOTE_PUBLIC" \
             "$INTERFACE"
+
     done
 
     echo
@@ -1163,7 +1241,8 @@ test_tunnel() {
 
     echo
     echo "Route:"
-    ip route get "$REMOTE_TUNNEL" || true
+    ip route get "$REMOTE_TUNNEL" ||
+        true
 
 
     echo
@@ -1172,7 +1251,8 @@ test_tunnel() {
         -I "$INTERFACE" \
         -c 3 \
         -W 2 \
-        "$REMOTE_TUNNEL" || true
+        "$REMOTE_TUNNEL" ||
+        true
 
 
     echo
@@ -1241,7 +1321,8 @@ show_traffic() {
     load_cfg "$id" ||
         die "Tunnel not found."
 
-    ip -s link show "$INTERFACE" || true
+    ip -s link show "$INTERFACE" ||
+        true
 }
 
 
@@ -1255,12 +1336,27 @@ repair() {
 
     for file in "$TUNNELS"/*.conf; do
 
-        [[ -f "$file" ]] || continue
+        [[ -f "$file" ]] ||
+            continue
+
+        unset \
+            ID \
+            ROLE \
+            LOCAL_PUBLIC \
+            REMOTE_PUBLIC \
+            INTERFACE \
+            LOCAL_TUNNEL \
+            REMOTE_TUNNEL \
+            SUBNET \
+            MTU \
+            ENABLED
 
         # shellcheck disable=SC1090
         source "$file"
 
-        [[ "${ENABLED:-0}" == "1" ]] || continue
+
+        [[ "${ENABLED:-0}" == "1" ]] ||
+            continue
 
 
         info "Repairing tunnel $ID..."
@@ -1271,6 +1367,7 @@ repair() {
         if [[ "$ROLE" == "IRAN" ]]; then
 
             flush_port_rules "$ID"
+
             apply_ports "$ID"
 
         fi
@@ -1411,6 +1508,7 @@ port_menu() {
             4)
 
                 flush_port_rules "$id"
+
                 apply_ports "$id"
 
                 ok "Rules re-applied."
@@ -1427,6 +1525,7 @@ port_menu() {
             *)
                 warn "Invalid option."
                 ;;
+
         esac
 
     done
@@ -1515,6 +1614,7 @@ manage() {
             *)
                 warn "Invalid option."
                 ;;
+
         esac
 
     done
@@ -1543,6 +1643,7 @@ add_tunnel() {
     local mtu=1476
 
     local file
+    local confirm
 
 
     clear_screen
@@ -1573,6 +1674,7 @@ add_tunnel() {
         *)
             die "Invalid role."
             ;;
+
     esac
 
 
@@ -1616,10 +1718,6 @@ add_tunnel() {
         die "Local and remote public IP cannot be identical."
 
 
-    # --------------------------------------------------------
-    # ID
-    # --------------------------------------------------------
-
     if [[ "$role" == "FOREIGN" ]]; then
 
         echo
@@ -1638,13 +1736,22 @@ add_tunnel() {
     fi
 
 
-    # --------------------------------------------------------
-    # Duplicate endpoint protection
-    # --------------------------------------------------------
-
     for file in "$TUNNELS"/*.conf; do
 
-        [[ -f "$file" ]] || continue
+        [[ -f "$file" ]] ||
+            continue
+
+        unset \
+            ID \
+            ROLE \
+            LOCAL_PUBLIC \
+            REMOTE_PUBLIC \
+            INTERFACE \
+            LOCAL_TUNNEL \
+            REMOTE_TUNNEL \
+            SUBNET \
+            MTU \
+            ENABLED
 
         # shellcheck disable=SC1090
         source "$file"
@@ -1666,10 +1773,6 @@ add_tunnel() {
     done
 
 
-    # --------------------------------------------------------
-    # Interface / subnet
-    # --------------------------------------------------------
-
     iface="picaso-gre${id}"
 
     subnet="$(subnet_for_id "$id")"
@@ -1677,16 +1780,10 @@ add_tunnel() {
 
     if [[ "$role" == "IRAN" ]]; then
 
-        # IRAN = .2
-        # FOREIGN = .1
-
         local_tun="$(ip_plus "$subnet" 2)"
         remote_tun="$(ip_plus "$subnet" 1)"
 
     else
-
-        # FOREIGN = .1
-        # IRAN = .2
 
         local_tun="$(ip_plus "$subnet" 1)"
         remote_tun="$(ip_plus "$subnet" 2)"
@@ -1714,8 +1811,7 @@ add_tunnel() {
         confirm
 
 
-    [[ "$confirm" =~ ^[Yy]$ ]] ||
-    {
+    [[ "$confirm" =~ ^[Yy]$ ]] || {
         warn "Cancelled."
         return
     }
@@ -1909,6 +2005,7 @@ optimization_menu() {
             *)
                 warn "Invalid option."
                 ;;
+
         esac
 
     done
@@ -1952,7 +2049,8 @@ while true; do
 
     for file in "$TUNNELS"/*.conf; do
 
-        [[ -f "$file" ]] || continue
+        [[ -f "$file" ]] ||
+            continue
 
         unset \
             ID \
@@ -1965,7 +2063,8 @@ while true; do
         source "$file"
 
 
-        [[ "${ENABLED:-0}" == "1" ]] || continue
+        [[ "${ENABLED:-0}" == "1" ]] ||
+            continue
 
 
         state="MISSING"
@@ -2018,10 +2117,6 @@ EOF
     chmod 755 "$MONITOR"
 
 
-    # --------------------------------------------------------
-    # Restore service
-    # --------------------------------------------------------
-
     cat > "/etc/systemd/system/$RESTORE_UNIT" <<EOF
 [Unit]
 Description=PICASO GRE Restore
@@ -2036,10 +2131,6 @@ ExecStart=$RESTORE
 WantedBy=multi-user.target
 EOF
 
-
-    # --------------------------------------------------------
-    # Monitor service
-    # --------------------------------------------------------
 
     cat > "/etc/systemd/system/$MONITOR_UNIT" <<EOF
 [Unit]
@@ -2060,6 +2151,7 @@ EOF
 
     systemctl daemon-reload
 
+
     systemctl enable \
         "$RESTORE_UNIT" \
         "$MONITOR_UNIT" \
@@ -2067,7 +2159,8 @@ EOF
 
 
     systemctl restart "$MONITOR_UNIT" \
-        >/dev/null 2>&1 || true
+        >/dev/null 2>&1 ||
+        true
 }
 
 
@@ -2076,6 +2169,9 @@ EOF
 # ============================================================
 
 uninstall() {
+
+    local confirm
+    local file
 
     clear_screen
 
@@ -2093,6 +2189,7 @@ uninstall() {
     echo " - PICASO configuration"
     echo " - PICASO logs"
     echo " - PICASO command"
+
     echo
     echo "PICASO will NOT:"
     echo
@@ -2107,8 +2204,7 @@ uninstall() {
         confirm
 
 
-    [[ "$confirm" == "DELETE" ]] ||
-    {
+    [[ "$confirm" == "DELETE" ]] || {
         warn "Cancelled."
         return
     }
@@ -2117,28 +2213,42 @@ uninstall() {
     systemctl disable --now \
         "$MONITOR_UNIT" \
         "$RESTORE_UNIT" \
-        >/dev/null 2>&1 || true
+        >/dev/null 2>&1 ||
+        true
 
-
-    local file
 
     for file in "$TUNNELS"/*.conf; do
 
-        [[ -f "$file" ]] || continue
+        [[ -f "$file" ]] ||
+            continue
+
+        unset \
+            ID \
+            ROLE \
+            LOCAL_PUBLIC \
+            REMOTE_PUBLIC \
+            INTERFACE \
+            LOCAL_TUNNEL \
+            REMOTE_TUNNEL \
+            SUBNET \
+            MTU \
+            ENABLED
 
         # shellcheck disable=SC1090
         source "$file"
 
-        flush_port_rules "$ID" || true
+
+        flush_port_rules "$ID" ||
+            true
 
         gre_fw_del \
             "$REMOTE_PUBLIC" \
-            "$INTERFACE" \
-            || true
+            "$INTERFACE" ||
+            true
 
         delete_iface \
-            "$INTERFACE" \
-            || true
+            "$INTERFACE" ||
+            true
 
     done
 
@@ -2176,6 +2286,9 @@ uninstall() {
 # ============================================================
 
 main() {
+
+    local choice
+    local id
 
     require_root
 
@@ -2365,6 +2478,7 @@ main() {
                 sleep 1
 
                 ;;
+
         esac
 
     done
