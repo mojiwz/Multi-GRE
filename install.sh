@@ -1,85 +1,95 @@
 #!/usr/bin/env bash
 
 # ============================================================
-# PICASO GRE MANAGER
-# Multi-Tunnel GRE Management System
+# PICASO
+# Multi GRE Tunnel Manager
+# ============================================================
 #
-# Features:
-#   - Multiple independent GRE tunnels
-#   - Add / Start / Stop / Restart / Delete
-#   - Test / Details / Traffic
-#   - Persistent configuration
-#   - Automatic restore after reboot
-#   - Health monitor
-#   - Repair / Synchronize
-#   - BBR optimization
-#   - Network optimization
-#   - Safe uninstall
+# Architecture:
 #
-# Default tunnel network:
-#   132.168.30.0/30
-#   132.168.31.0/30
-#   132.168.32.0/30
-#   ...
+# Client
+#   |
+#   | Public Iran IP : Port
+#   v
+# Iran Server
+#   |
+#   | DNAT
+#   v
+# GRE Tunnel
+#   |
+#   v
+# Foreign Server
+#   |
+#   v
+# Xray / Service
 #
-# Interface:
-#   picaso-gre1
-#   picaso-gre2
-#   ...
+# GRE:
+#   Iran    = .2
+#   Foreign = .1
+#
+# Example:
+#   Client -> 45.135.242.173:443
+#            |
+#            v
+#   132.168.30.1:443
+#            |
+#            v
+#   Foreign Xray
 #
 # ============================================================
 
-set -u
+set -Eeuo pipefail
 
-VERSION="1.0.0"
+VERSION="3.0.0"
 
 BASE_DIR="/etc/picaso"
 TUNNEL_DIR="${BASE_DIR}/tunnels"
-STATE_FILE="${BASE_DIR}/manager.conf"
+PORT_DIR="${BASE_DIR}/ports"
+LOG_DIR="/var/log"
+LOG_FILE="${LOG_DIR}/picaso.log"
 
 BIN="/usr/local/bin/picaso"
-RESTORE_BIN="/usr/local/sbin/picaso-restore"
-MONITOR_BIN="/usr/local/sbin/picaso-monitor"
+RESTORE="/usr/local/sbin/picaso-restore"
+MONITOR="/usr/local/sbin/picaso-monitor"
 
-LOG_FILE="/var/log/picaso.log"
+RESTORE_SERVICE="picaso-restore.service"
+MONITOR_SERVICE="picaso-monitor.service"
 
-RESTORE_SERVICE="/etc/systemd/system/picaso-restore.service"
-MONITOR_SERVICE="/etc/systemd/system/picaso-monitor.service"
+MANAGER_CONF="${BASE_DIR}/manager.conf"
+STATE_FILE="${BASE_DIR}/next_id"
 
-BASE_SUBNET=30
-MTU_DEFAULT=1476
+IPTABLES="iptables"
 
-# ------------------------------------------------------------
-# Colors
-# ------------------------------------------------------------
-
-RED='\033[0;31m'
+CYAN='\033[0;36m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
+RED='\033[0;31m'
 BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-MAGENTA='\033[0;35m'
-WHITE='\033[1;37m'
 RESET='\033[0m'
 
-# ------------------------------------------------------------
-# Basic helpers
-# ------------------------------------------------------------
+# ============================================================
+# BASIC
+# ============================================================
 
-msg() {
-    echo -e "${CYAN}$*${RESET}"
+log() {
+    mkdir -p "$LOG_DIR"
+    echo "[$(date '+%F %T')] $*" >> "$LOG_FILE"
 }
 
-success() {
-    echo -e "${GREEN}✓ $*${RESET}"
+info() {
+    echo -e "${CYAN}[INFO]${RESET} $*"
 }
 
-warning() {
-    echo -e "${YELLOW}! $*${RESET}"
+ok() {
+    echo -e "${GREEN}[ OK ]${RESET} $*"
+}
+
+warn() {
+    echo -e "${YELLOW}[WARN]${RESET} $*"
 }
 
 error() {
-    echo -e "${RED}✗ $*${RESET}"
+    echo -e "${RED}[ERROR]${RESET} $*" >&2
 }
 
 die() {
@@ -87,1479 +97,1532 @@ die() {
     exit 1
 }
 
-pause_screen() {
+pause() {
     echo
-    read -rp "Press Enter to continue..." _
-}
-
-log_msg() {
-    mkdir -p "$(dirname "$LOG_FILE")"
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE"
+    read -r -p "Press Enter to continue..." _
 }
 
 require_root() {
-    if [[ "${EUID}" -ne 0 ]]; then
-        error "This script must be run as root."
-        exit 1
-    fi
+    [[ "$EUID" -eq 0 ]] || die "Run this script as root."
 }
 
-# ------------------------------------------------------------
-# Dependency installation
-# ------------------------------------------------------------
-
-install_dependencies() {
-
-    local packages=(
-        iproute2
-        iputils-ping
-        procps
-        curl
-        grep
-        sed
+require_commands() {
+    local commands=(
+        ip
+        iptables
+        systemctl
         awk
-        coreutils
-        util-linux
+        sed
+        grep
+        ping
     )
 
-    msg "Checking dependencies..."
-
-    if command -v apt-get >/dev/null 2>&1; then
-
-        export DEBIAN_FRONTEND=noninteractive
-
-        apt-get update -y >/dev/null 2>&1
-
-        apt-get install -y \
-            iproute2 \
-            iputils-ping \
-            procps \
-            curl \
-            grep \
-            sed \
-            gawk \
-            coreutils \
-            util-linux \
-            >/dev/null 2>&1
-
-    elif command -v dnf >/dev/null 2>&1; then
-
-        dnf install -y \
-            iproute \
-            iputils \
-            procps-ng \
-            curl \
-            grep \
-            sed \
-            gawk \
-            coreutils \
-            util-linux \
-            >/dev/null 2>&1
-
-    elif command -v yum >/dev/null 2>&1; then
-
-        yum install -y \
-            iproute \
-            iputils \
-            procps-ng \
-            curl \
-            grep \
-            sed \
-            gawk \
-            coreutils \
-            util-linux \
-            >/dev/null 2>&1
-
-    else
-        warning "Unknown package manager."
-        warning "Please make sure required commands are installed."
-    fi
-
-    success "Dependencies checked."
+    for cmd in "${commands[@]}"; do
+        command -v "$cmd" >/dev/null 2>&1 || die "Required command not found: $cmd"
+    done
 }
 
-# ------------------------------------------------------------
-# Initialization
-# ------------------------------------------------------------
+# ============================================================
+# DIRECTORY / CONFIG
+# ============================================================
 
-initialize_picaso() {
-
+init_dirs() {
     mkdir -p "$BASE_DIR"
     mkdir -p "$TUNNEL_DIR"
+    mkdir -p "$PORT_DIR"
 
     touch "$LOG_FILE"
 
     if [[ ! -f "$STATE_FILE" ]]; then
+        echo "1" > "$STATE_FILE"
+    fi
 
-        cat > "$STATE_FILE" <<EOF
-PICASO_VERSION="$VERSION"
-NEXT_ID=1
+    if [[ ! -f "$MANAGER_CONF" ]]; then
+        cat > "$MANAGER_CONF" <<EOF
+PICASO_VERSION=${VERSION}
+DEFAULT_SUBNET_BASE=10.250
 EOF
-
     fi
 }
 
-# ------------------------------------------------------------
-# IPv4 validation
-# ------------------------------------------------------------
+# ============================================================
+# VALIDATION
+# ============================================================
 
 valid_ipv4() {
-
     local ip="$1"
+    local IFS=.
 
-    [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+    read -r a b c d <<< "$ip" || return 1
 
-    IFS='.' read -r a b c d <<< "$ip"
+    [[ "$a" =~ ^[0-9]+$ ]] || return 1
+    [[ "$b" =~ ^[0-9]+$ ]] || return 1
+    [[ "$c" =~ ^[0-9]+$ ]] || return 1
+    [[ "$d" =~ ^[0-9]+$ ]] || return 1
 
-    (( a <= 255 && b <= 255 && c <= 255 && d <= 255 ))
+    ((a <= 255 && b <= 255 && c <= 255 && d <= 255))
 }
 
-# ------------------------------------------------------------
-# Public IP detection
-# ------------------------------------------------------------
+valid_port() {
+    local p="$1"
+    [[ "$p" =~ ^[0-9]+$ ]] || return 1
+    ((p >= 1 && p <= 65535))
+}
+
+valid_proto() {
+    case "$1" in
+        tcp|udp) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# ============================================================
+# PUBLIC IP
+# ============================================================
 
 detect_public_ip() {
 
     local ip=""
 
-    if command -v curl >/dev/null 2>&1; then
-        ip="$(curl -4 -fsS --max-time 5 https://api.ipify.org 2>/dev/null || true)"
-    fi
-
-    if valid_ipv4 "$ip"; then
-        echo "$ip"
-        return 0
-    fi
-
-    ip="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '
-        {
+    ip=$(ip -4 route get 1.1.1.1 2>/dev/null |
+        awk '{
             for(i=1;i<=NF;i++)
                 if($i=="src") {
                     print $(i+1)
                     exit
                 }
-        }
-    ')"
+        }' || true)
 
     if valid_ipv4 "$ip"; then
         echo "$ip"
         return 0
     fi
 
-    return 1
+    ip=$(ip -4 addr show scope global |
+        awk '/inet / {
+            sub("/.*","",$2)
+            print $2
+            exit
+        }' || true)
+
+    valid_ipv4 "$ip" && echo "$ip"
 }
 
-# ------------------------------------------------------------
-# ID handling
-# ------------------------------------------------------------
+# ============================================================
+# ID MANAGEMENT
+# ============================================================
 
 get_next_id() {
 
-    local next
+    local id
 
-    next="$(grep '^NEXT_ID=' "$STATE_FILE" 2>/dev/null |
-        tail -n1 |
-        cut -d= -f2)"
+    id=$(cat "$STATE_FILE" 2>/dev/null || echo 1)
 
-    if [[ "$next" =~ ^[0-9]+$ ]] && (( next > 0 )); then
-        echo "$next"
-        return
-    fi
+    [[ "$id" =~ ^[0-9]+$ ]] || id=1
 
-    echo 1
+    echo $((id + 1)) > "$STATE_FILE"
+
+    echo "$id"
 }
 
-save_next_id() {
+tunnel_exists() {
+    [[ -f "${TUNNEL_DIR}/$1.conf" ]]
+}
 
+# ============================================================
+# TUNNEL CONFIG
+# ============================================================
+
+save_tunnel() {
     local id="$1"
-
-    if grep -q '^NEXT_ID=' "$STATE_FILE"; then
-
-        sed -i "s/^NEXT_ID=.*/NEXT_ID=$id/" "$STATE_FILE"
-
-    else
-
-        echo "NEXT_ID=$id" >> "$STATE_FILE"
-
-    fi
-}
-
-interface_name() {
-    echo "picaso-gre$1"
-}
-
-config_file() {
-    echo "${TUNNEL_DIR}/$1.conf"
-}
-
-# ------------------------------------------------------------
-# Tunnel subnet calculation
-# ------------------------------------------------------------
-
-calculate_subnet() {
-
-    local id="$1"
-
-    # ID 1 => 132.168.30.0/30
-    # ID 2 => 132.168.31.0/30
-    # ...
-    #
-    # Keep the third octet in valid IPv4 range.
-
-    local third=$((BASE_SUBNET + id - 1))
-
-    if (( third > 254 )); then
-        return 1
-    fi
-
-    echo "132.168.${third}.0"
-}
-
-local_tunnel_ip() {
-
-    local subnet="$1"
     local role="$2"
+    local local_public="$3"
+    local remote_public="$4"
+    local iface="$5"
+    local local_tun="$6"
+    local remote_tun="$7"
+    local subnet="$8"
+    local mtu="$9"
 
-    if [[ "$role" == "iran" ]]; then
-        echo "${subnet%.*}.2"
-    else
-        echo "${subnet%.*}.1"
-    fi
+    cat > "${TUNNEL_DIR}/${id}.conf" <<EOF
+ID=${id}
+ROLE=${role}
+LOCAL_PUBLIC=${local_public}
+REMOTE_PUBLIC=${remote_public}
+INTERFACE=${iface}
+LOCAL_TUNNEL=${local_tun}
+REMOTE_TUNNEL=${remote_tun}
+SUBNET=${subnet}
+MTU=${mtu}
+ENABLED=1
+EOF
 }
 
-remote_tunnel_ip() {
-
-    local subnet="$1"
-    local role="$2"
-
-    if [[ "$role" == "iran" ]]; then
-        echo "${subnet%.*}.1"
-    else
-        echo "${subnet%.*}.2"
-    fi
-}
-
-# ------------------------------------------------------------
-# Config reading
-# ------------------------------------------------------------
-
-load_config() {
-
+load_tunnel() {
     local id="$1"
-    local file
-
-    file="$(config_file "$id")"
+    local file="${TUNNEL_DIR}/${id}.conf"
 
     [[ -f "$file" ]] || return 1
 
     # shellcheck disable=SC1090
     source "$file"
-
-    return 0
 }
 
-# ------------------------------------------------------------
-# Check whether an ID is used
-# ------------------------------------------------------------
+# ============================================================
+# SUBNET ALLOCATION
+# ============================================================
 
-id_exists() {
+get_subnet_for_id() {
 
     local id="$1"
 
-    [[ -f "$(config_file "$id")" ]]
+    local index=$((id - 1))
+    local second=$((index / 64))
+    local block=$((index % 64))
+
+    echo "10.250.${second}.$((block * 4))/30"
 }
 
-# ------------------------------------------------------------
-# Check whether interface exists
-# ------------------------------------------------------------
+subnet_local_ip() {
+    local subnet="$1"
+
+    echo "$subnet" |
+        awk -F'[./]' '{print $1"."$2"."$3"."($4+1)}'
+}
+
+subnet_remote_ip() {
+    local subnet="$1"
+
+    echo "$subnet" |
+        awk -F'[./]' '{print $1"."$2"."$3"."($4+2)}'
+}
+
+# ============================================================
+# INTERFACE
+# ============================================================
 
 interface_exists() {
+    ip link show "$1" >/dev/null 2>&1
+}
 
+delete_interface() {
     local iface="$1"
 
-    ip link show "$iface" >/dev/null 2>&1
-}
-
-# ------------------------------------------------------------
-# Check whether public IP is already used
-# ------------------------------------------------------------
-
-remote_ip_exists() {
-
-    local remote="$1"
-    local file
-
-    for file in "$TUNNEL_DIR"/*.conf; do
-
-        [[ -f "$file" ]] || continue
-
-        unset REMOTE_PUBLIC_IP
-
-        # shellcheck disable=SC1090
-        source "$file"
-
-        if [[ "${REMOTE_PUBLIC_IP:-}" == "$remote" ]]; then
-            return 0
-        fi
-
-    done
-
-    return 1
-}
-
-# ------------------------------------------------------------
-# Firewall
-# ------------------------------------------------------------
-
-firewall_add() {
-
-    local remote="$1"
-    local iface="$2"
-
-    if command -v iptables >/dev/null 2>&1; then
-
-        if ! iptables -C INPUT \
-            -p 47 \
-            -s "$remote" \
-            -m comment \
-            --comment "PICASO-GRE-$iface" \
-            -j ACCEPT 2>/dev/null; then
-
-            iptables -I INPUT 1 \
-                -p 47 \
-                -s "$remote" \
-                -m comment \
-                --comment "PICASO-GRE-$iface" \
-                -j ACCEPT
-        fi
-
-        if ! iptables -C INPUT \
-            -i "$iface" \
-            -m comment \
-            --comment "PICASO-TUNNEL-$iface" \
-            -j ACCEPT 2>/dev/null; then
-
-            iptables -I INPUT 1 \
-                -i "$iface" \
-                -m comment \
-                --comment "PICASO-TUNNEL-$iface" \
-                -j ACCEPT
-        fi
-
-        if ! iptables -C FORWARD \
-            -i "$iface" \
-            -m comment \
-            --comment "PICASO-FWD-IN-$iface" \
-            -j ACCEPT 2>/dev/null; then
-
-            iptables -I FORWARD 1 \
-                -i "$iface" \
-                -m comment \
-                --comment "PICASO-FWD-IN-$iface" \
-                -j ACCEPT
-        fi
-
-        if ! iptables -C FORWARD \
-            -o "$iface" \
-            -m comment \
-            --comment "PICASO-FWD-OUT-$iface" \
-            -j ACCEPT 2>/dev/null; then
-
-            iptables -I FORWARD 1 \
-                -o "$iface" \
-                -m comment \
-                --comment "PICASO-FWD-OUT-$iface" \
-                -j ACCEPT
-        fi
-
-        log_msg "Firewall rules added for $iface"
+    if interface_exists "$iface"; then
+        ip link set "$iface" down 2>/dev/null || true
+        ip tunnel del "$iface" 2>/dev/null || true
     fi
 }
 
-firewall_remove() {
+# ============================================================
+# GRE FIREWALL
+# ============================================================
 
-    local remote="$1"
+add_gre_firewall() {
+
+    local remote_public="$1"
     local iface="$2"
 
-    if ! command -v iptables >/dev/null 2>&1; then
-        return
-    fi
+    iptables -C INPUT \
+        -p 47 \
+        -s "$remote_public" \
+        -j ACCEPT \
+        -m comment \
+        --comment "PICASO GRE ${iface}" \
+        2>/dev/null ||
+    iptables -I INPUT 1 \
+        -p 47 \
+        -s "$remote_public" \
+        -j ACCEPT \
+        -m comment \
+        --comment "PICASO GRE ${iface}"
+
+    iptables -C INPUT \
+        -i "$iface" \
+        -j ACCEPT \
+        -m comment \
+        --comment "PICASO TUNNEL ${iface}" \
+        2>/dev/null ||
+    iptables -I INPUT 1 \
+        -i "$iface" \
+        -j ACCEPT \
+        -m comment \
+        --comment "PICASO TUNNEL ${iface}"
+}
+
+remove_gre_firewall() {
+
+    local remote_public="$1"
+    local iface="$2"
 
     while iptables -C INPUT \
         -p 47 \
-        -s "$remote" \
+        -s "$remote_public" \
+        -j ACCEPT \
         -m comment \
-        --comment "PICASO-GRE-$iface" \
-        -j ACCEPT 2>/dev/null; do
+        --comment "PICASO GRE ${iface}" \
+        2>/dev/null; do
 
         iptables -D INPUT \
             -p 47 \
-            -s "$remote" \
+            -s "$remote_public" \
+            -j ACCEPT \
             -m comment \
-            --comment "PICASO-GRE-$iface" \
-            -j ACCEPT
-
+            --comment "PICASO GRE ${iface}" || true
     done
 
     while iptables -C INPUT \
         -i "$iface" \
+        -j ACCEPT \
         -m comment \
-        --comment "PICASO-TUNNEL-$iface" \
-        -j ACCEPT 2>/dev/null; do
+        --comment "PICASO TUNNEL ${iface}" \
+        2>/dev/null; do
 
         iptables -D INPUT \
             -i "$iface" \
+            -j ACCEPT \
             -m comment \
-            --comment "PICASO-TUNNEL-$iface" \
-            -j ACCEPT
-
+            --comment "PICASO TUNNEL ${iface}" || true
     done
-
-    while iptables -C FORWARD \
-        -i "$iface" \
-        -m comment \
-        --comment "PICASO-FWD-IN-$iface" \
-        -j ACCEPT 2>/dev/null; do
-
-        iptables -D FORWARD \
-            -i "$iface" \
-            -m comment \
-            --comment "PICASO-FWD-IN-$iface" \
-            -j ACCEPT
-
-    done
-
-    while iptables -C FORWARD \
-        -o "$iface" \
-        -m comment \
-        --comment "PICASO-FWD-OUT-$iface" \
-        -j ACCEPT 2>/dev/null; do
-
-        iptables -D FORWARD \
-            -o "$iface" \
-            -m comment \
-            --comment "PICASO-FWD-OUT-$iface" \
-            -j ACCEPT
-
-    done
-
-    log_msg "Firewall rules removed for $iface"
 }
 
-# ------------------------------------------------------------
-# Enable forwarding
-# ------------------------------------------------------------
+# ============================================================
+# CREATE GRE
+# ============================================================
 
-enable_forwarding() {
-
-    sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
-
-    mkdir -p /etc/sysctl.d
-
-    cat > /etc/sysctl.d/99-picaso-forwarding.conf <<EOF
-net.ipv4.ip_forward = 1
-EOF
-
-    sysctl --system >/dev/null 2>&1 || true
-
-    success "IPv4 forwarding enabled."
-}
-
-# ------------------------------------------------------------
-# Create tunnel
-# ------------------------------------------------------------
-
-create_tunnel() {
+create_gre() {
 
     local id="$1"
 
-    load_config "$id" || {
-        error "Configuration for tunnel $id not found."
-        return 1
-    }
+    load_tunnel "$id" || die "Tunnel $id not found."
 
-    local iface="$INTERFACE"
+    info "Creating ${INTERFACE}..."
 
-    if interface_exists "$iface"; then
+    if interface_exists "$INTERFACE"; then
 
-        warning "$iface already exists."
+        local current
 
-        # Do not touch an existing interface blindly.
+        current=$(ip -d link show "$INTERFACE" 2>/dev/null || true)
+
+        if ! grep -q "remote ${REMOTE_PUBLIC}" <<< "$current" ||
+           ! grep -q "local ${LOCAL_PUBLIC}" <<< "$current"; then
+
+            warn "Existing ${INTERFACE} does not match configuration."
+            ip link set "$INTERFACE" down 2>/dev/null || true
+            ip tunnel del "$INTERFACE" 2>/dev/null || true
+
+        else
+            info "${INTERFACE} already exists."
+        fi
+    fi
+
+    if ! interface_exists "$INTERFACE"; then
+
+        ip tunnel add "$INTERFACE" \
+            mode gre \
+            local "$LOCAL_PUBLIC" \
+            remote "$REMOTE_PUBLIC" \
+            ttl 255
+
+    fi
+
+    ip link set "$INTERFACE" mtu "$MTU"
+    ip link set "$INTERFACE" up
+
+    if ! ip addr show dev "$INTERFACE" |
+        grep -q "inet ${LOCAL_TUNNEL}/"; then
+
+        ip addr add "${LOCAL_TUNNEL}/30" dev "$INTERFACE"
+    fi
+
+    add_gre_firewall "$REMOTE_PUBLIC" "$INTERFACE"
+
+    ok "${INTERFACE} is configured."
+
+    log "Tunnel ${id} GRE configured: ${LOCAL_PUBLIC} -> ${REMOTE_PUBLIC}"
+}
+
+# ============================================================
+# FORWARDING
+# ============================================================
+
+enable_forwarding() {
+
+    sysctl -w net.ipv4.ip_forward=1 >/dev/null
+
+    cat > /etc/sysctl.d/99-picaso-forwarding.conf <<EOF
+net.ipv4.ip_forward=1
+EOF
+
+    sysctl --system >/dev/null 2>&1 || true
+}
+
+# ============================================================
+# PORT RULES
+# ============================================================
+
+add_port_rule() {
+
+    local id="$1"
+    local proto="$2"
+    local public_port="$3"
+    local destination_port="$4"
+
+    valid_proto "$proto" || die "Invalid protocol."
+    valid_port "$public_port" || die "Invalid public port."
+    valid_port "$destination_port" || die "Invalid destination port."
+
+    local file="${PORT_DIR}/${id}.rules"
+
+    touch "$file"
+
+    if grep -q "^${proto}|${public_port}|${destination_port}$" "$file"; then
+        warn "This forwarding rule already exists."
         return 0
     fi
 
-    msg "Creating $iface..."
+    echo "${proto}|${public_port}|${destination_port}" >> "$file"
 
-    ip tunnel add "$iface" \
-        mode gre \
-        local "$LOCAL_PUBLIC_IP" \
-        remote "$REMOTE_PUBLIC_IP" \
-        ttl 255
+    ok "Forwarding added: ${proto} ${public_port} -> ${destination_port}"
 
-    if [[ $? -ne 0 ]]; then
-        error "Failed to create $iface."
-        log_msg "ERROR: failed to create $iface"
-        return 1
-    fi
-
-    ip link set "$iface" mtu "${MTU:-$MTU_DEFAULT}"
-
-    ip addr add "${LOCAL_TUNNEL_IP}/30" dev "$iface"
-
-    ip link set "$iface" up
-
-    firewall_add "$REMOTE_PUBLIC_IP" "$iface"
-
-    success "$iface created."
-
-    log_msg "Tunnel $id ($iface) created."
-
-    return 0
+    apply_port_rules "$id"
 }
 
-# ------------------------------------------------------------
-# Start tunnel
-# ------------------------------------------------------------
+remove_port_rule() {
+
+    local id="$1"
+    local proto="$2"
+    local public_port="$3"
+    local destination_port="$4"
+
+    local file="${PORT_DIR}/${id}.rules"
+
+    [[ -f "$file" ]] || return 0
+
+    sed -i \
+        "\#^${proto}|${public_port}|${destination_port}$#d" \
+        "$file"
+
+    clear_port_rules "$id"
+    apply_port_rules "$id"
+}
+
+# ============================================================
+# PORT FIREWALL RULES
+# ============================================================
+
+clear_port_rules() {
+
+    local id="$1"
+
+    load_tunnel "$id" || return 0
+
+    local file="${PORT_DIR}/${id}.rules"
+
+    [[ -f "$file" ]] || return 0
+
+    while IFS='|' read -r proto public_port destination_port; do
+
+        [[ -z "$proto" ]] && continue
+        [[ "$proto" =~ ^# ]] && continue
+
+        # PREROUTING DNAT
+        while iptables -t nat -C PREROUTING \
+            -i "$(ip route show default | awk 'NR==1{print $5}')" \
+            -p "$proto" \
+            -d "$LOCAL_PUBLIC" \
+            --dport "$public_port" \
+            -j DNAT \
+            --to-destination "${REMOTE_TUNNEL}:${destination_port}" \
+            -m comment \
+            --comment "PICASO PF ${id}" \
+            2>/dev/null; do
+
+            iptables -t nat -D PREROUTING \
+                -i "$(ip route show default | awk 'NR==1{print $5}')" \
+                -p "$proto" \
+                -d "$LOCAL_PUBLIC" \
+                --dport "$public_port" \
+                -j DNAT \
+                --to-destination "${REMOTE_TUNNEL}:${destination_port}" \
+                -m comment \
+                --comment "PICASO PF ${id}" || true
+        done
+
+        # FORWARD incoming
+        while iptables -C FORWARD \
+            -i "$(ip route show default | awk 'NR==1{print $5}')" \
+            -o "$INTERFACE" \
+            -p "$proto" \
+            -d "$REMOTE_TUNNEL" \
+            --dport "$destination_port" \
+            -m conntrack \
+            --ctstate NEW,ESTABLISHED,RELATED \
+            -j ACCEPT \
+            -m comment \
+            --comment "PICASO PF ${id}" \
+            2>/dev/null; do
+
+            iptables -D FORWARD \
+                -i "$(ip route show default | awk 'NR==1{print $5}')" \
+                -o "$INTERFACE" \
+                -p "$proto" \
+                -d "$REMOTE_TUNNEL" \
+                --dport "$destination_port" \
+                -m conntrack \
+                --ctstate NEW,ESTABLISHED,RELATED \
+                -j ACCEPT \
+                -m comment \
+                --comment "PICASO PF ${id}" || true
+        done
+
+        # FORWARD return
+        while iptables -C FORWARD \
+            -i "$INTERFACE" \
+            -o "$(ip route show default | awk 'NR==1{print $5}')" \
+            -p "$proto" \
+            -s "$REMOTE_TUNNEL" \
+            --sport "$destination_port" \
+            -m conntrack \
+            --ctstate ESTABLISHED,RELATED \
+            -j ACCEPT \
+            -m comment \
+            --comment "PICASO PF ${id}" \
+            2>/dev/null; do
+
+            iptables -D FORWARD \
+                -i "$INTERFACE" \
+                -o "$(ip route show default | awk 'NR==1{print $5}')" \
+                -p "$proto" \
+                -s "$REMOTE_TUNNEL" \
+                --sport "$destination_port" \
+                -m conntrack \
+                --ctstate ESTABLISHED,RELATED \
+                -j ACCEPT \
+                -m comment \
+                --comment "PICASO PF ${id}" || true
+        done
+
+        # SNAT / MASQUERADE
+        while iptables -t nat -C POSTROUTING \
+            -o "$INTERFACE" \
+            -p "$proto" \
+            -d "$REMOTE_TUNNEL" \
+            --dport "$destination_port" \
+            -j MASQUERADE \
+            -m comment \
+            --comment "PICASO PF ${id}" \
+            2>/dev/null; do
+
+            iptables -t nat -D POSTROUTING \
+                -o "$INTERFACE" \
+                -p "$proto" \
+                -d "$REMOTE_TUNNEL" \
+                --dport "$destination_port" \
+                -j MASQUERADE \
+                -m comment \
+                --comment "PICASO PF ${id}" || true
+        done
+
+    done < "$file"
+}
+
+apply_port_rules() {
+
+    local id="$1"
+
+    load_tunnel "$id" || return 0
+
+    [[ "$ROLE" == "IRAN" ]] || return 0
+
+    local file="${PORT_DIR}/${id}.rules"
+
+    [[ -f "$file" ]] || return 0
+
+    enable_forwarding
+
+    local wan
+    wan=$(ip route show default |
+        awk 'NR==1{print $5}')
+
+    [[ -n "$wan" ]] || die "Could not detect WAN interface."
+
+    while IFS='|' read -r proto public_port destination_port; do
+
+        [[ -z "$proto" ]] && continue
+        [[ "$proto" =~ ^# ]] && continue
+
+        # ----------------------------------------------------
+        # CLIENT -> IRAN PUBLIC IP -> FOREIGN TUNNEL IP
+        # ----------------------------------------------------
+
+        iptables -t nat -C PREROUTING \
+            -i "$wan" \
+            -p "$proto" \
+            -d "$LOCAL_PUBLIC" \
+            --dport "$public_port" \
+            -j DNAT \
+            --to-destination "${REMOTE_TUNNEL}:${destination_port}" \
+            -m comment \
+            --comment "PICASO PF ${id}" \
+            2>/dev/null || {
+
+            iptables -t nat -A PREROUTING \
+                -i "$wan" \
+                -p "$proto" \
+                -d "$LOCAL_PUBLIC" \
+                --dport "$public_port" \
+                -j DNAT \
+                --to-destination "${REMOTE_TUNNEL}:${destination_port}" \
+                -m comment \
+                --comment "PICASO PF ${id}"
+        }
+
+        # ----------------------------------------------------
+        # CLIENT -> FOREIGN
+        # ----------------------------------------------------
+
+        iptables -C FORWARD \
+            -i "$wan" \
+            -o "$INTERFACE" \
+            -p "$proto" \
+            -d "$REMOTE_TUNNEL" \
+            --dport "$destination_port" \
+            -m conntrack \
+            --ctstate NEW,ESTABLISHED,RELATED \
+            -j ACCEPT \
+            -m comment \
+            --comment "PICASO PF ${id}" \
+            2>/dev/null || {
+
+            iptables -A FORWARD \
+                -i "$wan" \
+                -o "$INTERFACE" \
+                -p "$proto" \
+                -d "$REMOTE_TUNNEL" \
+                --dport "$destination_port" \
+                -m conntrack \
+                --ctstate NEW,ESTABLISHED,RELATED \
+                -j ACCEPT \
+                -m comment \
+                --comment "PICASO PF ${id}"
+        }
+
+        # ----------------------------------------------------
+        # FOREIGN -> IRAN -> CLIENT
+        # ----------------------------------------------------
+
+        iptables -C FORWARD \
+            -i "$INTERFACE" \
+            -o "$wan" \
+            -p "$proto" \
+            -s "$REMOTE_TUNNEL" \
+            --sport "$destination_port" \
+            -m conntrack \
+            --ctstate ESTABLISHED,RELATED \
+            -j ACCEPT \
+            -m comment \
+            --comment "PICASO PF ${id}" \
+            2>/dev/null || {
+
+            iptables -A FORWARD \
+                -i "$INTERFACE" \
+                -o "$wan" \
+                -p "$proto" \
+                -s "$REMOTE_TUNNEL" \
+                --sport "$destination_port" \
+                -m conntrack \
+                --ctstate ESTABLISHED,RELATED \
+                -j ACCEPT \
+                -m comment \
+                --comment "PICASO PF ${id}"
+        }
+
+        # ----------------------------------------------------
+        # IMPORTANT:
+        #
+        # Foreign Xray must see the connection as coming from
+        # the Iran GRE endpoint (132.168.x.x).
+        #
+        # This guarantees that the Foreign server sends the
+        # response back through GRE.
+        # ----------------------------------------------------
+
+        iptables -t nat -C POSTROUTING \
+            -o "$INTERFACE" \
+            -p "$proto" \
+            -d "$REMOTE_TUNNEL" \
+            --dport "$destination_port" \
+            -j MASQUERADE \
+            -m comment \
+            --comment "PICASO PF ${id}" \
+            2>/dev/null || {
+
+            iptables -t nat -A POSTROUTING \
+                -o "$INTERFACE" \
+                -p "$proto" \
+                -d "$REMOTE_TUNNEL" \
+                --dport "$destination_port" \
+                -j MASQUERADE \
+                -m comment \
+                --comment "PICASO PF ${id}"
+        }
+
+        log "Port forwarding ${id}: ${proto} ${public_port} -> ${REMOTE_TUNNEL}:${destination_port}"
+
+    done < "$file"
+
+    ok "Port forwarding rules applied for tunnel ${id}."
+}
+
+# ============================================================
+# DELETE ALL PICASO FIREWALL RULES FOR TUNNEL
+# ============================================================
+
+remove_tunnel_firewall() {
+
+    local id="$1"
+
+    load_tunnel "$id" || return 0
+
+    local file="${PORT_DIR}/${id}.rules"
+
+    if [[ -f "$file" ]]; then
+
+        while IFS='|' read -r proto public_port destination_port; do
+
+            [[ -z "$proto" ]] && continue
+            [[ "$proto" =~ ^# ]] && continue
+
+            local wan
+            wan=$(ip route show default | awk 'NR==1{print $5}')
+
+            # DNAT
+            while iptables -t nat -C PREROUTING \
+                -i "$wan" \
+                -p "$proto" \
+                -d "$LOCAL_PUBLIC" \
+                --dport "$public_port" \
+                -j DNAT \
+                --to-destination "${REMOTE_TUNNEL}:${destination_port}" \
+                -m comment \
+                --comment "PICASO PF ${id}" \
+                2>/dev/null; do
+
+                iptables -t nat -D PREROUTING \
+                    -i "$wan" \
+                    -p "$proto" \
+                    -d "$LOCAL_PUBLIC" \
+                    --dport "$public_port" \
+                    -j DNAT \
+                    --to-destination "${REMOTE_TUNNEL}:${destination_port}" \
+                    -m comment \
+                    --comment "PICASO PF ${id}" || true
+            done
+
+            # FORWARD
+            while iptables -C FORWARD \
+                -i "$wan" \
+                -o "$INTERFACE" \
+                -p "$proto" \
+                -d "$REMOTE_TUNNEL" \
+                --dport "$destination_port" \
+                -m conntrack \
+                --ctstate NEW,ESTABLISHED,RELATED \
+                -j ACCEPT \
+                -m comment \
+                --comment "PICASO PF ${id}" \
+                2>/dev/null; do
+
+                iptables -D FORWARD \
+                    -i "$wan" \
+                    -o "$INTERFACE" \
+                    -p "$proto" \
+                    -d "$REMOTE_TUNNEL" \
+                    --dport "$destination_port" \
+                    -m conntrack \
+                    --ctstate NEW,ESTABLISHED,RELATED \
+                    -j ACCEPT \
+                    -m comment \
+                    --comment "PICASO PF ${id}" || true
+            done
+
+            # RETURN FORWARD
+            while iptables -C FORWARD \
+                -i "$INTERFACE" \
+                -o "$wan" \
+                -p "$proto" \
+                -s "$REMOTE_TUNNEL" \
+                --sport "$destination_port" \
+                -m conntrack \
+                --ctstate ESTABLISHED,RELATED \
+                -j ACCEPT \
+                -m comment \
+                --comment "PICASO PF ${id}" \
+                2>/dev/null; do
+
+                iptables -D FORWARD \
+                    -i "$INTERFACE" \
+                    -o "$wan" \
+                    -p "$proto" \
+                    -s "$REMOTE_TUNNEL" \
+                    --sport "$destination_port" \
+                    -m conntrack \
+                    --ctstate ESTABLISHED,RELATED \
+                    -j ACCEPT \
+                    -m comment \
+                    --comment "PICASO PF ${id}" || true
+            done
+
+            # MASQUERADE
+            while iptables -t nat -C POSTROUTING \
+                -o "$INTERFACE" \
+                -p "$proto" \
+                -d "$REMOTE_TUNNEL" \
+                --dport "$destination_port" \
+                -j MASQUERADE \
+                -m comment \
+                --comment "PICASO PF ${id}" \
+                2>/dev/null; do
+
+                iptables -t nat -D POSTROUTING \
+                    -o "$INTERFACE" \
+                    -p "$proto" \
+                    -d "$REMOTE_TUNNEL" \
+                    --dport "$destination_port" \
+                    -j MASQUERADE \
+                    -m comment \
+                    --comment "PICASO PF ${id}" || true
+            done
+
+        done < "$file"
+    fi
+
+    remove_gre_firewall "$REMOTE_PUBLIC" "$INTERFACE"
+}
+
+# ============================================================
+# START / STOP
+# ============================================================
 
 start_tunnel() {
 
     local id="$1"
 
-    load_config "$id" || {
-        error "Tunnel $id configuration not found."
-        return 1
-    }
+    load_tunnel "$id" || die "Tunnel $id does not exist."
 
-    if ! interface_exists "$INTERFACE"; then
-        create_tunnel "$id" || return 1
+    if [[ "$ROLE" != "IRAN" && "$ROLE" != "FOREIGN" ]]; then
+        die "Invalid tunnel role."
     fi
 
-    ip link set "$INTERFACE" up 2>/dev/null || true
+    sed -i 's/^ENABLED=.*/ENABLED=1/' "${TUNNEL_DIR}/${id}.conf"
 
-    success "Tunnel $id started."
+    create_gre "$id"
 
-    log_msg "Tunnel $id started."
+    if [[ "$ROLE" == "IRAN" ]]; then
+        apply_port_rules "$id"
+    fi
+
+    ok "Tunnel $id started."
+    log "Tunnel $id started."
 }
-
-# ------------------------------------------------------------
-# Stop tunnel
-# ------------------------------------------------------------
 
 stop_tunnel() {
 
     local id="$1"
 
-    load_config "$id" || {
-        error "Tunnel $id configuration not found."
-        return 1
-    }
+    load_tunnel "$id" || die "Tunnel $id does not exist."
 
-    if interface_exists "$INTERFACE"; then
+    sed -i 's/^ENABLED=.*/ENABLED=0/' "${TUNNEL_DIR}/${id}.conf"
 
-        ip link set "$INTERFACE" down 2>/dev/null || true
+    remove_tunnel_firewall "$id"
 
-        success "Tunnel $id stopped."
+    delete_interface "$INTERFACE"
 
-        log_msg "Tunnel $id stopped."
-
-    else
-
-        warning "Tunnel $id is already stopped."
-
-    fi
+    ok "Tunnel $id stopped."
+    log "Tunnel $id stopped."
 }
-
-# ------------------------------------------------------------
-# Restart tunnel
-# ------------------------------------------------------------
 
 restart_tunnel() {
 
     local id="$1"
 
-    load_config "$id" || {
-        error "Tunnel $id configuration not found."
-        return 1
-    }
-
-    msg "Restarting tunnel $id..."
-
-    stop_tunnel "$id" >/dev/null 2>&1 || true
-
+    stop_tunnel "$id"
     sleep 1
-
-    if interface_exists "$INTERFACE"; then
-
-        ip link set "$INTERFACE" down 2>/dev/null || true
-
-        ip link delete "$INTERFACE" 2>/dev/null || true
-
-    fi
-
-    create_tunnel "$id" || return 1
-
-    success "Tunnel $id restarted."
-
-    log_msg "Tunnel $id restarted."
+    start_tunnel "$id"
 }
-
-# ------------------------------------------------------------
-# Delete tunnel
-# ------------------------------------------------------------
 
 delete_tunnel() {
 
     local id="$1"
 
-    load_config "$id" || {
-        error "Tunnel $id configuration not found."
-        return 1
+    load_tunnel "$id" || die "Tunnel $id does not exist."
+
+    echo
+    warn "This will permanently delete tunnel ${id}."
+    read -r -p "Type DELETE to continue: " confirm
+
+    [[ "$confirm" == "DELETE" ]] || {
+        warn "Cancelled."
+        return
     }
 
-    echo
-    warning "You are about to delete:"
-    echo
-    echo "  ID          : $id"
-    echo "  Interface   : $INTERFACE"
-    echo "  Remote IP   : $REMOTE_PUBLIC_IP"
-    echo "  Tunnel IP   : $LOCAL_TUNNEL_IP"
-    echo
+    remove_tunnel_firewall "$id"
+    delete_interface "$INTERFACE"
 
-    read -rp "Type DELETE to confirm: " confirm
+    rm -f "${TUNNEL_DIR}/${id}.conf"
+    rm -f "${PORT_DIR}/${id}.rules"
 
-    if [[ "$confirm" != "DELETE" ]]; then
-        warning "Cancelled."
-        return
-    fi
-
-    firewall_remove "$REMOTE_PUBLIC_IP" "$INTERFACE"
-
-    if interface_exists "$INTERFACE"; then
-        ip link delete "$INTERFACE" 2>/dev/null || true
-    fi
-
-    rm -f "$(config_file "$id")"
-
-    success "Tunnel $id deleted."
-
-    log_msg "Tunnel $id deleted."
-
+    ok "Tunnel $id deleted."
+    log "Tunnel $id deleted."
 }
 
-# ------------------------------------------------------------
-# Test tunnel
-# ------------------------------------------------------------
+# ============================================================
+# TEST
+# ============================================================
 
 test_tunnel() {
 
     local id="$1"
 
-    load_config "$id" || {
-        error "Tunnel $id not found."
-        return 1
+    load_tunnel "$id" || die "Tunnel $id does not exist."
+
+    echo
+    echo "========================================"
+    echo " PICASO Tunnel Test - ${id}"
+    echo "========================================"
+    echo
+
+    echo "Interface:"
+    ip -d link show "$INTERFACE" 2>/dev/null || {
+        error "Interface does not exist."
+        return
     }
 
     echo
-    echo "----------------------------------------------"
-    echo " Tunnel Test: $INTERFACE"
-    echo "----------------------------------------------"
-
-    if ! interface_exists "$INTERFACE"; then
-        error "Interface does not exist."
-        return 1
-    fi
+    echo "Addresses:"
+    ip addr show "$INTERFACE"
 
     echo
-    ip -br addr show "$INTERFACE"
+    echo "Route:"
+    ip route get "$REMOTE_TUNNEL" 2>/dev/null || true
 
     echo
-    msg "Testing remote tunnel IP: $REMOTE_TUNNEL_IP"
-
-    if ping -I "$INTERFACE" -c 4 -W 2 "$REMOTE_TUNNEL_IP"; then
-
-        success "Tunnel connectivity: OK"
-
-        log_msg "Tunnel $id connectivity OK"
-
-        return 0
-
+    echo "Ping remote tunnel:"
+    if ping -I "$INTERFACE" -c 3 -W 2 "$REMOTE_TUNNEL"; then
+        ok "GRE tunnel is reachable."
     else
-
-        error "Tunnel connectivity: FAILED"
-
-        log_msg "Tunnel $id connectivity FAILED"
-
-        return 1
+        error "Remote tunnel IP is not reachable."
     fi
+
+    echo
+    echo "Traffic:"
+    ip -s link show "$INTERFACE"
+
+    echo
+    echo "GRE packets:"
+    echo "Use:"
+    echo "  tcpdump -ni any 'ip proto 47'"
 }
 
-# ------------------------------------------------------------
-# Details
-# ------------------------------------------------------------
+# ============================================================
+# DETAILS
+# ============================================================
 
 show_details() {
 
     local id="$1"
 
-    load_config "$id" || {
-        error "Tunnel $id not found."
-        return 1
-    }
+    load_tunnel "$id" || die "Tunnel $id does not exist."
 
     echo
-    echo "========================================================"
-    echo "                  TUNNEL DETAILS"
-    echo "========================================================"
+    echo "========================================"
+    echo " Tunnel ${id}"
+    echo "========================================"
     echo
-    echo "ID              : $ID"
-    echo "Name            : $NAME"
-    echo "Role            : $ROLE"
-    echo "Interface       : $INTERFACE"
-    echo "Local Public IP : $LOCAL_PUBLIC_IP"
-    echo "Remote Public IP: $REMOTE_PUBLIC_IP"
-    echo "Subnet          : $SUBNET/30"
-    echo "Local Tunnel IP : $LOCAL_TUNNEL_IP"
-    echo "Remote Tunnel IP: $REMOTE_TUNNEL_IP"
-    echo "MTU             : $MTU"
-    echo
-
-    echo "IP tunnel:"
-    ip tunnel show "$INTERFACE" 2>/dev/null || true
+    echo "Role           : $ROLE"
+    echo "Interface      : $INTERFACE"
+    echo "Local public   : $LOCAL_PUBLIC"
+    echo "Remote public  : $REMOTE_PUBLIC"
+    echo "Local tunnel   : $LOCAL_TUNNEL"
+    echo "Remote tunnel  : $REMOTE_TUNNEL"
+    echo "Subnet         : $SUBNET"
+    echo "MTU            : $MTU"
+    echo "Enabled        : $ENABLED"
 
     echo
-    echo "Interface:"
-    ip -details link show "$INTERFACE" 2>/dev/null || true
+    echo "Port forwarding:"
 
-    echo
-    echo "Address:"
-    ip addr show "$INTERFACE" 2>/dev/null || true
+    if [[ -f "${PORT_DIR}/${id}.rules" ]] &&
+       [[ -s "${PORT_DIR}/${id}.rules" ]]; then
 
-    echo
-    echo "Route:"
-    ip route get "$REMOTE_TUNNEL_IP" 2>/dev/null || true
+        while IFS='|' read -r proto public destination; do
+            echo "  ${proto}: ${public} -> ${REMOTE_TUNNEL}:${destination}"
+        done < "${PORT_DIR}/${id}.rules"
 
-    echo
+    else
+        echo "  None"
+    fi
 }
 
-# ------------------------------------------------------------
-# Traffic
-# ------------------------------------------------------------
+# ============================================================
+# TRAFFIC
+# ============================================================
 
 show_traffic() {
 
     local id="$1"
 
-    load_config "$id" || {
-        error "Tunnel $id not found."
-        return 1
-    }
-
-    if ! interface_exists "$INTERFACE"; then
-        error "Interface does not exist."
-        return 1
-    fi
+    load_tunnel "$id" || die "Tunnel $id does not exist."
 
     echo
-    echo "========================================================"
-    echo "                  TRAFFIC: $INTERFACE"
-    echo "========================================================"
-    echo
-
     ip -s link show "$INTERFACE"
 }
 
-# ------------------------------------------------------------
-# Tunnel status
-# ------------------------------------------------------------
+# ============================================================
+# PORT FORWARD MENU
+# ============================================================
 
-get_tunnel_status() {
+port_forward_menu() {
 
     local id="$1"
 
-    load_config "$id" || {
-        echo "MISSING"
+    load_tunnel "$id" || die "Tunnel $id does not exist."
+
+    [[ "$ROLE" == "IRAN" ]] || {
+        warn "Port forwarding is configured on the IRAN side."
+        pause
         return
-    }
-
-    if ! interface_exists "$INTERFACE"; then
-        echo "DOWN"
-        return
-    fi
-
-    if ip link show "$INTERFACE" 2>/dev/null |
-        grep -q "state UP"; then
-
-        echo "UP"
-
-    else
-
-        echo "DOWN"
-
-    fi
-}
-
-# ------------------------------------------------------------
-# List tunnels
-# ------------------------------------------------------------
-
-list_tunnels() {
-
-    local found=0
-    local file
-    local id
-
-    echo
-    echo "========================================================"
-    echo "                     PICASO"
-    echo "========================================================"
-    echo
-    printf "%-5s %-20s %-18s %-10s\n" \
-        "ID" "NAME" "REMOTE IP" "STATUS"
-    echo "--------------------------------------------------------"
-
-    shopt -s nullglob
-
-    for file in "$TUNNEL_DIR"/*.conf; do
-
-        found=1
-
-        id="$(basename "$file" .conf)"
-
-        load_config "$id"
-
-        local status
-        status="$(get_tunnel_status "$id")"
-
-        printf "%-5s %-20s %-18s %-10s\n" \
-            "$ID" \
-            "${NAME:0:20}" \
-            "$REMOTE_PUBLIC_IP" \
-            "$status"
-
-    done
-
-    shopt -u nullglob
-
-    if (( found == 0 )); then
-        echo "No tunnels configured."
-    fi
-
-    echo "--------------------------------------------------------"
-    echo
-}
-
-# ------------------------------------------------------------
-# Add tunnel
-# ------------------------------------------------------------
-
-add_tunnel() {
-
-    echo
-    echo "========================================================"
-    echo "                   ADD NEW CONNECTION"
-    echo "========================================================"
-    echo
-
-    local next_id
-    next_id="$(get_next_id)"
-
-    echo "Next available tunnel ID: $next_id"
-    echo
-
-    local role
-
-    while true; do
-
-        echo "Select server role:"
-        echo
-        echo "  1) Iran"
-        echo "  2) Foreign"
-        echo
-
-        read -rp "Role [1-2]: " role
-
-        case "$role" in
-            1)
-                role="iran"
-                break
-                ;;
-            2)
-                role="foreign"
-                break
-                ;;
-            *)
-                error "Invalid choice."
-                ;;
-        esac
-
-    done
-
-    local id="$next_id"
-
-    if [[ "$role" == "foreign" ]]; then
-
-        echo
-        read -rp \
-            "Enter the Tunnel ID assigned by Iran server [$next_id]: " custom_id
-
-        if [[ -n "$custom_id" ]]; then
-            id="$custom_id"
-        fi
-
-    fi
-
-    if ! [[ "$id" =~ ^[0-9]+$ ]] || (( id < 1 )); then
-        error "Invalid tunnel ID."
-        return 1
-    fi
-
-    if id_exists "$id"; then
-        error "Tunnel ID $id already exists."
-        return 1
-    fi
-
-    local subnet
-
-    subnet="$(calculate_subnet "$id")" || {
-        error "Could not allocate subnet for ID $id."
-        return 1
-    }
-
-    echo
-    read -rp "Connection name (e.g. Germany-1): " name
-
-    if [[ -z "$name" ]]; then
-        name="Tunnel-$id"
-    fi
-
-    echo
-    msg "Detecting local public IP..."
-
-    local detected_ip=""
-
-    detected_ip="$(detect_public_ip || true)"
-
-    if valid_ipv4 "$detected_ip"; then
-        echo "Detected public IP: $detected_ip"
-    else
-        warning "Could not automatically detect public IP."
-    fi
-
-    echo
-    read -rp \
-        "Local public IP [${detected_ip:-manual}]: " local_public
-
-    if [[ -z "$local_public" ]]; then
-        local_public="$detected_ip"
-    fi
-
-    if ! valid_ipv4 "$local_public"; then
-        error "Invalid local public IP."
-        return 1
-    fi
-
-    echo
-    read -rp "Remote public IP: " remote_public
-
-    if ! valid_ipv4 "$remote_public"; then
-        error "Invalid remote public IP."
-        return 1
-    fi
-
-    if [[ "$local_public" == "$remote_public" ]]; then
-        error "Local and remote public IP cannot be the same."
-        return 1
-    fi
-
-    if remote_ip_exists "$remote_public"; then
-
-        warning "This remote IP is already used by another PICASO tunnel."
-
-        read -rp "Continue anyway? [y/N]: " answer
-
-        if [[ ! "$answer" =~ ^[Yy]$ ]]; then
-            return
-        fi
-
-    fi
-
-    local local_tunnel
-    local remote_tunnel
-
-    local_tunnel="$(local_tunnel_ip "$subnet" "$role")"
-    remote_tunnel="$(remote_tunnel_ip "$subnet" "$role")"
-
-    local iface
-    iface="$(interface_name "$id")"
-
-    echo
-    echo "========================================================"
-    echo "                 CONNECTION PREVIEW"
-    echo "========================================================"
-    echo
-    echo "ID               : $id"
-    echo "Name             : $name"
-    echo "Role             : $role"
-    echo "Interface        : $iface"
-    echo "Local Public IP  : $local_public"
-    echo "Remote Public IP : $remote_public"
-    echo "Subnet           : $subnet/30"
-    echo "Local Tunnel IP  : $local_tunnel"
-    echo "Remote Tunnel IP : $remote_tunnel"
-    echo "MTU              : $MTU_DEFAULT"
-    echo
-
-    read -rp "Create this tunnel? [y/N]: " confirm
-
-    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-        warning "Cancelled."
-        return
-    fi
-
-    cat > "$(config_file "$id")" <<EOF
-ID="$id"
-NAME="$name"
-ROLE="$role"
-
-INTERFACE="$iface"
-
-LOCAL_PUBLIC_IP="$local_public"
-REMOTE_PUBLIC_IP="$remote_public"
-
-SUBNET="$subnet"
-
-LOCAL_TUNNEL_IP="$local_tunnel"
-REMOTE_TUNNEL_IP="$remote_tunnel"
-
-MTU="$MTU_DEFAULT"
-CREATED_AT="$(date '+%Y-%m-%d %H:%M:%S')"
-EOF
-
-    chmod 600 "$(config_file "$id")"
-
-    enable_forwarding
-
-    if ! create_tunnel "$id"; then
-
-        error "Tunnel creation failed."
-
-        rm -f "$(config_file "$id")"
-
-        return 1
-    fi
-
-    if [[ "$role" == "iran" ]]; then
-
-        local new_next=$((id + 1))
-
-        if (( new_next > $(get_next_id) )); then
-            save_next_id "$new_next"
-        fi
-
-    fi
-
-    success "Tunnel $id successfully created."
-
-    log_msg "Tunnel $id ($name) added."
-
-    echo
-    echo "IMPORTANT:"
-    echo "Create the matching tunnel on the other server using:"
-    echo
-    echo "  Tunnel ID       : $id"
-    echo "  Remote Tunnel IP: $local_tunnel"
-    echo
-}
-
-# ------------------------------------------------------------
-# Manage tunnel menu
-# ------------------------------------------------------------
-
-manage_tunnel() {
-
-    local id="$1"
-
-    load_config "$id" || {
-        error "Tunnel $id not found."
-        return 1
     }
 
     while true; do
 
         clear
 
-        local status
-        status="$(get_tunnel_status "$id")"
-
+        echo "========================================"
+        echo " PICASO - Port Forwarding"
+        echo " Tunnel: $id"
+        echo "========================================"
         echo
-        echo "========================================================"
-        echo "             MANAGE: $INTERFACE"
-        echo "========================================================"
+        echo "Foreign tunnel IP: $REMOTE_TUNNEL"
         echo
-        echo "Name            : $NAME"
-        echo "Remote IP       : $REMOTE_PUBLIC_IP"
-        echo "Tunnel IP       : $LOCAL_TUNNEL_IP"
-        echo "Remote Tunnel   : $REMOTE_TUNNEL_IP"
-        echo "Status          : $status"
-        echo
-        echo "--------------------------------------------------------"
-        echo
-        echo "  1) Start"
-        echo "  2) Stop"
-        echo "  3) Restart"
-        echo "  4) Delete"
-        echo "  5) Test connection"
-        echo "  6) Show details"
-        echo "  7) Show traffic"
-        echo "  8) Back"
+        echo "1) Add forwarding"
+        echo "2) Remove forwarding"
+        echo "3) List forwarding"
+        echo "4) Re-apply rules"
+        echo "0) Back"
         echo
 
-        read -rp "Select: " choice
+        read -r -p "Select: " choice
+
+        case "$choice" in
+
+            1)
+                echo
+                read -r -p "Protocol (tcp/udp): " proto
+                read -r -p "Public Iran port: " public_port
+                read -r -p "Foreign destination port: " destination_port
+
+                add_port_rule \
+                    "$id" \
+                    "$proto" \
+                    "$public_port" \
+                    "$destination_port"
+
+                pause
+                ;;
+
+            2)
+                echo
+                read -r -p "Protocol (tcp/udp): " proto
+                read -r -p "Public Iran port: " public_port
+                read -r -p "Foreign destination port: " destination_port
+
+                remove_port_rule \
+                    "$id" \
+                    "$proto" \
+                    "$public_port" \
+                    "$destination_port"
+
+                pause
+                ;;
+
+            3)
+                echo
+                if [[ -f "${PORT_DIR}/${id}.rules" ]]; then
+                    cat "${PORT_DIR}/${id}.rules"
+                else
+                    echo "No rules."
+                fi
+                pause
+                ;;
+
+            4)
+                clear_port_rules "$id"
+                apply_port_rules "$id"
+                pause
+                ;;
+
+            0)
+                return
+                ;;
+
+            *)
+                warn "Invalid option."
+                sleep 1
+                ;;
+        esac
+    done
+}
+
+# ============================================================
+# MANAGE TUNNEL
+# ============================================================
+
+manage_tunnel() {
+
+    local id="$1"
+
+    while true; do
+
+        clear
+
+        echo "========================================"
+        echo " PICASO - Manage Tunnel ${id}"
+        echo "========================================"
+
+        show_details "$id"
+
+        echo
+        echo "----------------------------------------"
+        echo "1) Start"
+        echo "2) Stop"
+        echo "3) Restart"
+        echo "4) Test"
+        echo "5) Details"
+        echo "6) Traffic"
+        echo "7) Port Forwarding"
+        echo "8) Delete"
+        echo "0) Back"
+        echo "----------------------------------------"
+
+        read -r -p "Select: " choice
 
         case "$choice" in
 
             1)
                 start_tunnel "$id"
-                pause_screen
+                pause
                 ;;
 
             2)
                 stop_tunnel "$id"
-                pause_screen
+                pause
                 ;;
 
             3)
                 restart_tunnel "$id"
-                pause_screen
+                pause
                 ;;
 
             4)
-                delete_tunnel "$id"
-                return
+                test_tunnel "$id"
+                pause
                 ;;
 
             5)
-                test_tunnel "$id"
-                pause_screen
+                show_details "$id"
+                pause
                 ;;
 
             6)
-                show_details "$id"
-                pause_screen
+                show_traffic "$id"
+                pause
                 ;;
 
             7)
-                show_traffic "$id"
-                pause_screen
+                port_forward_menu "$id"
                 ;;
 
             8)
+                delete_tunnel "$id"
+                pause
+                return
+                ;;
+
+            0)
                 return
                 ;;
 
             *)
-                error "Invalid option."
-                sleep 1
+                warn "Invalid option."
                 ;;
         esac
-
     done
 }
 
-# ------------------------------------------------------------
-# Select tunnel
-# ------------------------------------------------------------
+# ============================================================
+# LIST TUNNELS
+# ============================================================
 
-select_tunnel() {
-
-    list_tunnels
-
-    local id
-
-    read -rp "Enter tunnel ID: " id
-
-    if ! [[ "$id" =~ ^[0-9]+$ ]]; then
-        error "Invalid ID."
-        return
-    fi
-
-    if ! id_exists "$id"; then
-        error "Tunnel $id does not exist."
-        return
-    fi
-
-    manage_tunnel "$id"
-}
-
-# ------------------------------------------------------------
-# Check all tunnels
-# ------------------------------------------------------------
-
-check_all() {
+list_tunnels() {
 
     echo
-    msg "Checking all tunnels..."
+    echo "========================================"
+    echo " PICASO Connections"
+    echo "========================================"
     echo
 
-    local file
-    local id
-
-    shopt -s nullglob
+    local found=0
 
     for file in "$TUNNEL_DIR"/*.conf; do
 
-        id="$(basename "$file" .conf)"
+        [[ -e "$file" ]] || continue
 
-        load_config "$id"
+        found=1
 
-        local status
-        status="$(get_tunnel_status "$id")"
+        # shellcheck disable=SC1090
+        source "$file"
 
-        printf "%-20s : %-10s" "$INTERFACE" "$status"
-
-        if [[ "$status" == "UP" ]]; then
-
-            if ping -I "$INTERFACE" \
-                -c 1 \
-                -W 2 \
-                "$REMOTE_TUNNEL_IP" \
-                >/dev/null 2>&1; then
-
-                echo -e "${GREEN}PING OK${RESET}"
-
-            else
-
-                echo -e "${RED}PING FAILED${RESET}"
-
-            fi
-
-        else
-            echo
-        fi
-
-    done
-
-    shopt -u nullglob
-
-    echo
-}
-
-# ------------------------------------------------------------
-# Repair / synchronize
-# ------------------------------------------------------------
-
-repair_all() {
-
-    echo
-    msg "Synchronizing configured tunnels..."
-    echo
-
-    local file
-    local id
-
-    shopt -s nullglob
-
-    for file in "$TUNNEL_DIR"/*.conf; do
-
-        id="$(basename "$file" .conf)"
-
-        load_config "$id"
+        local status="DOWN"
 
         if interface_exists "$INTERFACE"; then
 
-            success "$INTERFACE already exists."
+            if ping -I "$INTERFACE" \
+                -c 1 \
+                -W 1 \
+                "$REMOTE_TUNNEL" >/dev/null 2>&1; then
+
+                status="UP"
+
+            else
+                status="DEGRADED"
+            fi
 
         else
 
-            warning "$INTERFACE missing. Recreating..."
-
-            if create_tunnel "$id"; then
-                success "$INTERFACE restored."
+            if [[ "${ENABLED:-0}" == "1" ]]; then
+                status="MISSING"
             else
-                error "Failed to restore $INTERFACE."
+                status="STOPPED"
+            fi
+        fi
+
+        printf "ID %-4s | %-8s | %-14s | %-15s | %-15s | %s\n" \
+            "$ID" \
+            "$status" \
+            "$ROLE" \
+            "$LOCAL_PUBLIC" \
+            "$REMOTE_PUBLIC" \
+            "$INTERFACE"
+    done
+
+    [[ "$found" -eq 1 ]] || echo "No tunnels configured."
+
+    echo
+}
+
+# ============================================================
+# CHECK ALL
+# ============================================================
+
+check_all() {
+
+    clear
+
+    list_tunnels
+
+    echo "Detailed checks:"
+    echo
+
+    for file in "$TUNNEL_DIR"/*.conf; do
+
+        [[ -e "$file" ]] || continue
+
+        # shellcheck disable=SC1090
+        source "$file"
+
+        printf "%-4s %-15s -> %-15s : " \
+            "$ID" \
+            "$LOCAL_TUNNEL" \
+            "$REMOTE_TUNNEL"
+
+        if interface_exists "$INTERFACE" &&
+           ping -I "$INTERFACE" \
+                -c 1 \
+                -W 1 \
+                "$REMOTE_TUNNEL" >/dev/null 2>&1; then
+
+            echo -e "${GREEN}OK${RESET}"
+
+        else
+            echo -e "${RED}FAILED${RESET}"
+        fi
+    done
+
+    pause
+}
+
+# ============================================================
+# REPAIR / SYNCHRONIZE
+# ============================================================
+
+repair_all() {
+
+    clear
+
+    echo "========================================"
+    echo " PICASO Repair / Synchronize"
+    echo "========================================"
+    echo
+
+    for file in "$TUNNEL_DIR"/*.conf; do
+
+        [[ -e "$file" ]] || continue
+
+        # shellcheck disable=SC1090
+        source "$file"
+
+        if [[ "${ENABLED:-0}" == "1" ]]; then
+
+            info "Repairing tunnel ${ID}..."
+
+            create_gre "$ID"
+
+            if [[ "$ROLE" == "IRAN" ]]; then
+                apply_port_rules "$ID"
             fi
 
         fi
-
     done
 
-    shopt -u nullglob
+    ok "Repair completed."
+    log "Repair completed."
 
-    echo
-    log_msg "Repair/synchronize completed."
-
+    pause
 }
 
-# ------------------------------------------------------------
+# ============================================================
+# ADD TUNNEL
+# ============================================================
+
+add_tunnel() {
+
+    clear
+
+    echo "========================================"
+    echo " PICASO - Add New Connection"
+    echo "========================================"
+    echo
+
+    echo "1) IRAN"
+    echo "2) FOREIGN"
+    echo
+
+    read -r -p "Server role: " role_choice
+
+    case "$role_choice" in
+        1) role="IRAN" ;;
+        2) role="FOREIGN" ;;
+        *)
+            error "Invalid role."
+            pause
+            return
+            ;;
+    esac
+
+    echo
+
+    local detected
+    detected=$(detect_public_ip || true)
+
+    if [[ -n "$detected" ]]; then
+        echo "Detected public IP: $detected"
+    fi
+
+    read -r -p "This server public IP [${detected}]: " local_public
+
+    [[ -n "$local_public" ]] || local_public="$detected"
+
+    valid_ipv4 "$local_public" ||
+        die "Invalid local public IPv4."
+
+    read -r -p "Remote server public IP: " remote_public
+
+    valid_ipv4 "$remote_public" ||
+        die "Invalid remote public IPv4."
+
+    [[ "$local_public" != "$remote_public" ]] ||
+        die "Local and remote public IP cannot be identical."
+
+    # Check duplicate remote/public pair
+    for file in "$TUNNEL_DIR"/*.conf; do
+
+        [[ -e "$file" ]] || continue
+
+        # shellcheck disable=SC1090
+        source "$file"
+
+        if [[ "$LOCAL_PUBLIC" == "$local_public" &&
+              "$REMOTE_PUBLIC" == "$remote_public" ]]; then
+
+            die "This exact tunnel already exists."
+        fi
+    done
+
+    local id
+    id=$(get_next_id)
+
+    local iface="picaso-gre${id}"
+
+    local subnet
+    subnet=$(get_subnet_for_id "$id")
+
+    local local_tun
+    local remote_tun
+
+    if [[ "$role" == "IRAN" ]]; then
+
+        local_tun=$(subnet_local_ip "$subnet")
+        remote_tun=$(subnet_remote_ip "$subnet")
+
+    else
+
+        local_tun=$(subnet_remote_ip "$subnet")
+        remote_tun=$(subnet_local_ip "$subnet")
+
+    fi
+
+    local mtu=1476
+
+    echo
+    echo "----------------------------------------"
+    echo "Tunnel ID       : $id"
+    echo "Role            : $role"
+    echo "Interface       : $iface"
+    echo "Local public    : $local_public"
+    echo "Remote public   : $remote_public"
+    echo "Subnet          : $subnet"
+    echo "Local tunnel IP : $local_tun"
+    echo "Remote tunnel IP: $remote_tun"
+    echo "MTU             : $mtu"
+    echo "----------------------------------------"
+    echo
+
+    read -r -p "Create this tunnel? [y/N]: " confirm
+
+    [[ "$confirm" =~ ^[Yy]$ ]] || {
+        warn "Cancelled."
+        pause
+        return
+    }
+
+    save_tunnel \
+        "$id" \
+        "$role" \
+        "$local_public" \
+        "$remote_public" \
+        "$iface" \
+        "$local_tun" \
+        "$remote_tun" \
+        "$subnet" \
+        "$mtu"
+
+    touch "${PORT_DIR}/${id}.rules"
+
+    create_gre "$id"
+
+    if [[ "$role" == "IRAN" ]]; then
+        enable_forwarding
+    fi
+
+    ok "Tunnel ${id} created successfully."
+
+    echo
+    echo "IMPORTANT:"
+    echo
+    echo "On the IRAN server:"
+    echo "  Add Port Forwarding rules."
+    echo
+    echo "Example:"
+    echo "  TCP 443 -> 443"
+    echo
+    echo "Then the client uses:"
+    echo "  ${local_public}:443"
+    echo
+    echo "Traffic will be:"
+    echo "  Client"
+    echo "    -> ${local_public}:443"
+    echo "    -> ${remote_tun}:443"
+    echo "    -> Foreign Xray"
+    echo
+
+    pause
+}
+
+# ============================================================
 # BBR
-# ------------------------------------------------------------
+# ============================================================
 
 install_bbr() {
 
     echo
-    echo "========================================================"
-    echo "                    BBR OPTIMIZATION"
-    echo "========================================================"
-    echo
-
-    local kernel
-    kernel="$(uname -r)"
-
-    echo "Kernel: $kernel"
-    echo
-
-    local available
-
-    available="$(sysctl -n net.ipv4.tcp_allowed_congestion_control 2>/dev/null || true)"
-
-    echo "Available congestion control:"
-    echo "  $available"
-    echo
-
-    if grep -qw bbr <<< "$available"; then
-
-        success "BBR is supported by this kernel."
-
-    else
-
-        warning "BBR is not currently available."
-
-        if modprobe tcp_bbr 2>/dev/null; then
-            success "tcp_bbr module loaded."
-        else
-            error "Could not load tcp_bbr."
-            error "Your kernel may not support BBR."
-            return 1
-        fi
-
-    fi
-
-    local now
-    now="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)"
-
-    echo "Current congestion control: ${now:-unknown}"
-    echo
-
-    sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1 || true
-    sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1 || {
-        error "Failed to enable BBR."
-        return 1
-    }
-
-    mkdir -p /etc/sysctl.d
-
-    cat > /etc/sysctl.d/99-picaso-bbr.conf <<EOF
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
-EOF
-
-    sysctl --system >/dev/null 2>&1 || true
-
-    success "BBR enabled."
-
-    echo
-    echo "Current settings:"
-    echo
-    sysctl net.core.default_qdisc
-    sysctl net.ipv4.tcp_congestion_control
-
-    log_msg "BBR enabled."
-}
-
-# ------------------------------------------------------------
-# Network optimization
-# ------------------------------------------------------------
-
-network_optimization() {
-
-    echo
-    echo "========================================================"
-    echo "                 NETWORK OPTIMIZATION"
-    echo "========================================================"
-    echo
-
-    mkdir -p /etc/sysctl.d
-
-    cat > /etc/sysctl.d/99-picaso-network.conf <<EOF
-# PICASO network optimization
-
-net.ipv4.ip_forward = 1
-
-net.core.default_qdisc = fq
-
-net.ipv4.tcp_mtu_probing = 1
-
-net.ipv4.tcp_fin_timeout = 15
-
-net.ipv4.tcp_keepalive_time = 600
-net.ipv4.tcp_keepalive_intvl = 60
-net.ipv4.tcp_keepalive_probes = 5
-
-net.core.somaxconn = 4096
-
-net.core.netdev_max_backlog = 16384
-
-net.ipv4.tcp_max_syn_backlog = 8192
-
-net.ipv4.tcp_syncookies = 1
-
-net.ipv4.tcp_rmem = 4096 87380 16777216
-net.ipv4.tcp_wmem = 4096 65536 16777216
-
-net.core.rmem_max = 16777216
-net.core.wmem_max = 16777216
-EOF
-
-    sysctl --system >/dev/null 2>&1 || true
-
-    success "Network optimization applied."
-
-    log_msg "Network optimization applied."
-
-    echo
-}
-
-# ------------------------------------------------------------
-# Show optimization
-# ------------------------------------------------------------
-
-show_optimization() {
-
-    echo
-    echo "========================================================"
-    echo "                 CURRENT SETTINGS"
-    echo "========================================================"
-    echo
-
-    echo "Kernel:"
-    uname -r
-
-    echo
-    echo "Congestion control:"
+    echo "Current congestion control:"
     sysctl net.ipv4.tcp_congestion_control 2>/dev/null || true
 
-    echo
-    echo "Available congestion control:"
-    sysctl net.ipv4.tcp_allowed_congestion_control 2>/dev/null || true
+    if [[ -f /proc/sys/net/ipv4/tcp_available_congestion_control ]]; then
 
-    echo
-    echo "Default qdisc:"
-    sysctl net.core.default_qdisc 2>/dev/null || true
+        if ! grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control; then
+            warn "BBR is not available in the current kernel."
+            return
+        fi
+    fi
 
-    echo
-    echo "IPv4 forwarding:"
-    sysctl net.ipv4.ip_forward 2>/dev/null || true
+    cat > /etc/sysctl.d/99-picaso-bbr.conf <<EOF
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+EOF
 
-    echo
-    echo "TCP MTU probing:"
-    sysctl net.ipv4.tcp_mtu_probing 2>/dev/null || true
+    sysctl --system >/dev/null 2>&1 || true
 
-    echo
+    ok "BBR configuration applied."
 }
 
-# ------------------------------------------------------------
-# Optimization menu
-# ------------------------------------------------------------
+# ============================================================
+# NETWORK OPTIMIZATION
+# ============================================================
+
+optimize_network() {
+
+    cat > /etc/sysctl.d/99-picaso-network.conf <<EOF
+net.ipv4.ip_forward=1
+
+net.ipv4.tcp_syncookies=1
+
+net.ipv4.tcp_fin_timeout=15
+
+net.ipv4.tcp_keepalive_time=600
+net.ipv4.tcp_keepalive_intvl=60
+net.ipv4.tcp_keepalive_probes=5
+
+net.ipv4.tcp_mtu_probing=1
+
+net.core.somaxconn=4096
+net.core.netdev_max_backlog=16384
+
+net.ipv4.tcp_max_syn_backlog=8192
+
+net.ipv4.ip_local_port_range=1024 65535
+EOF
+
+    sysctl --system >/dev/null 2>&1 || true
+
+    ok "Network optimization applied."
+}
+
+# ============================================================
+# OPTIMIZATION MENU
+# ============================================================
 
 optimization_menu() {
 
@@ -1567,245 +1630,192 @@ optimization_menu() {
 
         clear
 
+        echo "========================================"
+        echo " PICASO - Server Optimization"
+        echo "========================================"
         echo
-        echo "========================================================"
-        echo "                SERVER OPTIMIZATION"
-        echo "========================================================"
-        echo
-        echo "  1) Install / Enable BBR"
-        echo "  2) Optimize TCP / Network"
-        echo "  3) Enable IPv4 forwarding"
-        echo "  4) Apply all recommended optimizations"
-        echo "  5) Show current settings"
-        echo "  6) Back"
+        echo "1) Install / Enable BBR"
+        echo "2) Optimize TCP / Network"
+        echo "3) Enable IPv4 Forwarding"
+        echo "4) Apply All Recommended"
+        echo "5) Show Current Settings"
+        echo "0) Back"
         echo
 
-        read -rp "Select: " choice
+        read -r -p "Select: " choice
 
         case "$choice" in
 
             1)
                 install_bbr
-                pause_screen
+                pause
                 ;;
 
             2)
-                network_optimization
-                pause_screen
+                optimize_network
+                pause
                 ;;
 
             3)
                 enable_forwarding
-                pause_screen
+                ok "IPv4 forwarding enabled."
+                pause
                 ;;
 
             4)
-                install_bbr || true
-                network_optimization
+                install_bbr
+                optimize_network
                 enable_forwarding
-                success "All recommended optimizations applied."
-                pause_screen
+                ok "All recommended optimizations applied."
+                pause
                 ;;
 
             5)
-                show_optimization
-                pause_screen
+                echo
+                sysctl net.ipv4.ip_forward
+                sysctl net.ipv4.tcp_congestion_control
+                sysctl net.core.default_qdisc
+                echo
+                cat /proc/sys/net/ipv4/tcp_available_congestion_control
+                pause
                 ;;
 
-            6)
+            0)
                 return
                 ;;
 
             *)
-                error "Invalid option."
-                sleep 1
+                warn "Invalid option."
                 ;;
         esac
-
     done
 }
 
-# ------------------------------------------------------------
-# Logs
-# ------------------------------------------------------------
+# ============================================================
+# RESTORE SCRIPT
+# ============================================================
 
-show_logs() {
+install_restore_script() {
 
-    echo
-    echo "========================================================"
-    echo "                     PICASO LOG"
-    echo "========================================================"
-    echo
-
-    if [[ -f "$LOG_FILE" ]]; then
-        tail -n 100 "$LOG_FILE"
-    else
-        echo "No log file."
-    fi
-}
-
-live_logs() {
-
-    touch "$LOG_FILE"
-
-    tail -f "$LOG_FILE"
-}
-
-# ------------------------------------------------------------
-# Restore service
-# ------------------------------------------------------------
-
-create_restore_service() {
-
-    cat > "$RESTORE_BIN" <<'EOF'
+    cat > "$RESTORE" <<'EOF'
 #!/usr/bin/env bash
+
+set -u
 
 BASE_DIR="/etc/picaso"
 TUNNEL_DIR="${BASE_DIR}/tunnels"
+BIN="/usr/local/bin/picaso"
 
-mkdir -p "$TUNNEL_DIR"
+sleep 3
 
-for file in "$TUNNEL_DIR"/*.conf; do
-
-    [[ -f "$file" ]] || continue
-
-    unset ID NAME ROLE INTERFACE
-    unset LOCAL_PUBLIC_IP REMOTE_PUBLIC_IP
-    unset SUBNET LOCAL_TUNNEL_IP REMOTE_TUNNEL_IP MTU
-
-    # shellcheck disable=SC1090
-    source "$file"
-
-    if ip link show "$INTERFACE" >/dev/null 2>&1; then
-        ip link set "$INTERFACE" up 2>/dev/null || true
-        continue
-    fi
-
-    ip tunnel add "$INTERFACE" \
-        mode gre \
-        local "$LOCAL_PUBLIC_IP" \
-        remote "$REMOTE_PUBLIC_IP" \
-        ttl 255 2>/dev/null || continue
-
-    ip link set "$INTERFACE" mtu "${MTU:-1476}" 2>/dev/null || true
-
-    ip addr add "${LOCAL_TUNNEL_IP}/30" \
-        dev "$INTERFACE" 2>/dev/null || true
-
-    ip link set "$INTERFACE" up 2>/dev/null || true
-
-done
+if [[ -x "$BIN" ]]; then
+    "$BIN" --restore
+fi
 EOF
 
-    chmod +x "$RESTORE_BIN"
-
-    cat > "$RESTORE_SERVICE" <<EOF
-[Unit]
-Description=PICASO GRE Restore
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=$RESTORE_BIN
-RemainAfterExit=yes
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    systemctl daemon-reload
-
-    systemctl enable picaso-restore.service >/dev/null 2>&1
-
-    success "Restore service installed."
+    chmod +x "$RESTORE"
 }
 
-# ------------------------------------------------------------
-# Monitor service
-# ------------------------------------------------------------
+# ============================================================
+# MONITOR SCRIPT
+# ============================================================
 
-create_monitor_service() {
+install_monitor_script() {
 
-    cat > "$MONITOR_BIN" <<'EOF'
+    cat > "$MONITOR" <<'EOF'
 #!/usr/bin/env bash
+
+set -u
 
 BASE_DIR="/etc/picaso"
 TUNNEL_DIR="${BASE_DIR}/tunnels"
 LOG_FILE="/var/log/picaso.log"
 
+mkdir -p "$(dirname "$LOG_FILE")"
+
 declare -A LAST_STATE
 
-log_msg() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE"
+log_state() {
+    echo "[$(date '+%F %T')] $*" >> "$LOG_FILE"
 }
 
 while true; do
 
-    shopt -s nullglob
-
     for file in "$TUNNEL_DIR"/*.conf; do
 
-        [[ -f "$file" ]] || continue
+        [[ -e "$file" ]] || continue
 
-        unset ID NAME ROLE INTERFACE
-        unset LOCAL_PUBLIC_IP REMOTE_PUBLIC_IP
-        unset SUBNET LOCAL_TUNNEL_IP REMOTE_TUNNEL_IP MTU
+        unset ID ROLE INTERFACE LOCAL_PUBLIC REMOTE_PUBLIC
+        unset LOCAL_TUNNEL REMOTE_TUNNEL SUBNET MTU ENABLED
 
         # shellcheck disable=SC1090
         source "$file"
 
-        state="DOWN"
+        [[ "${ENABLED:-0}" == "1" ]] || continue
+
+        state="MISSING"
 
         if ip link show "$INTERFACE" >/dev/null 2>&1; then
 
             if ping -I "$INTERFACE" \
                 -c 1 \
-                -W 2 \
-                "$REMOTE_TUNNEL_IP" \
-                >/dev/null 2>&1; then
+                -W 1 \
+                "$REMOTE_TUNNEL" >/dev/null 2>&1; then
 
                 state="UP"
-
             else
-
-                state="DOWN"
-
+                state="DEGRADED"
             fi
-
         fi
 
-        old="${LAST_STATE[$ID]:-UNKNOWN}"
+        previous="${LAST_STATE[$ID]:-UNKNOWN}"
 
-        if [[ "$state" != "$old" ]]; then
-
-            log_msg "Tunnel $ID ($INTERFACE) state changed: $old -> $state"
-
+        if [[ "$state" != "$previous" ]]; then
+            log_state "Tunnel ${ID} state changed: ${previous} -> ${state}"
             LAST_STATE[$ID]="$state"
-
         fi
 
     done
 
-    shopt -u nullglob
-
     sleep 30
-
 done
 EOF
 
-    chmod +x "$MONITOR_BIN"
+    chmod +x "$MONITOR"
+}
 
-    cat > "$MONITOR_SERVICE" <<EOF
+# ============================================================
+# SYSTEMD
+# ============================================================
+
+install_systemd() {
+
+    install_restore_script
+    install_monitor_script
+
+    cat > "/etc/systemd/system/${RESTORE_SERVICE}" <<EOF
 [Unit]
-Description=PICASO GRE Monitor
-After=network-online.target picaso-restore.service
+Description=PICASO GRE Tunnel Restore
+After=network-online.target
 Wants=network-online.target
-Requires=picaso-restore.service
+
+[Service]
+Type=oneshot
+ExecStart=${RESTORE}
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    cat > "/etc/systemd/system/${MONITOR_SERVICE}" <<EOF
+[Unit]
+Description=PICASO GRE Tunnel Monitor
+After=network-online.target ${RESTORE_SERVICE}
+Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=$MONITOR_BIN
+ExecStart=${MONITOR}
 Restart=always
 RestartSec=5
 
@@ -1815,190 +1825,184 @@ EOF
 
     systemctl daemon-reload
 
-    systemctl enable picaso-monitor.service >/dev/null 2>&1
-    systemctl restart picaso-monitor.service >/dev/null 2>&1 || true
+    systemctl enable "$RESTORE_SERVICE" >/dev/null 2>&1 || true
+    systemctl enable "$MONITOR_SERVICE" >/dev/null 2>&1 || true
 
-    success "Monitor service installed."
+    systemctl restart "$MONITOR_SERVICE" >/dev/null 2>&1 || true
 }
 
-# ------------------------------------------------------------
-# Uninstall
-# ------------------------------------------------------------
+# ============================================================
+# RESTORE MODE
+# ============================================================
+
+restore_all() {
+
+    init_dirs
+
+    enable_forwarding
+
+    for file in "$TUNNEL_DIR"/*.conf; do
+
+        [[ -e "$file" ]] || continue
+
+        # shellcheck disable=SC1090
+        source "$file"
+
+        [[ "${ENABLED:-0}" == "1" ]] || continue
+
+        # Re-create tunnel directly here to avoid recursion
+        if ! interface_exists "$INTERFACE"; then
+
+            ip tunnel add "$INTERFACE" \
+                mode gre \
+                local "$LOCAL_PUBLIC" \
+                remote "$REMOTE_PUBLIC" \
+                ttl 255 2>/dev/null || true
+        fi
+
+        ip link set "$INTERFACE" mtu "$MTU" 2>/dev/null || true
+        ip link set "$INTERFACE" up 2>/dev/null || true
+
+        if ! ip addr show dev "$INTERFACE" |
+            grep -q "inet ${LOCAL_TUNNEL}/"; then
+
+            ip addr add "${LOCAL_TUNNEL}/30" dev "$INTERFACE" \
+                2>/dev/null || true
+        fi
+
+        add_gre_firewall "$REMOTE_PUBLIC" "$INTERFACE" 2>/dev/null || true
+
+        if [[ "$ROLE" == "IRAN" ]]; then
+            apply_port_rules "$ID" 2>/dev/null || true
+        fi
+    done
+
+    log "PICASO restore completed."
+}
+
+# ============================================================
+# LOGS
+# ============================================================
+
+show_logs() {
+
+    echo
+    echo "========================================"
+    echo " PICASO Logs"
+    echo "========================================"
+    echo
+
+    if [[ -f "$LOG_FILE" ]]; then
+        tail -n 100 "$LOG_FILE"
+    else
+        echo "No logs."
+    fi
+
+    pause
+}
+
+# ============================================================
+# UNINSTALL
+# ============================================================
 
 uninstall_picaso() {
 
     clear
 
+    echo "========================================"
+    echo " PICASO COMPLETE UNINSTALL"
+    echo "========================================"
     echo
-    echo "========================================================"
-    echo "              COMPLETE PICASO UNINSTALL"
-    echo "========================================================"
+    echo "This will remove:"
+    echo
+    echo " - All PICASO GRE interfaces"
+    echo " - All PICASO port-forward rules"
+    echo " - PICASO GRE firewall rules"
+    echo " - PICASO systemd services"
+    echo " - PICASO configuration"
+    echo " - PICASO logs"
+    echo " - picaso command"
+    echo
+    echo "It will NOT:"
+    echo
+    echo " - Flush all iptables"
+    echo " - Delete gre0"
+    echo " - Delete unrelated firewall rules"
     echo
 
-    warning "This will remove PICASO from this server."
-    echo
-    echo "It will remove:"
-    echo
-    echo "  - All PICASO GRE tunnels"
-    echo "  - PICASO configurations"
-    echo "  - Restore service"
-    echo "  - Monitor service"
-    echo "  - PICASO firewall rules"
-    echo "  - PICASO logs"
-    echo "  - PICASO command"
-    echo
+    read -r -p "Type DELETE to continue: " confirm
 
-    read -rp "Are you sure? [yes/NO]: " confirm
-
-    if [[ "$confirm" != "yes" ]]; then
-        warning "Uninstall cancelled."
+    [[ "$confirm" == "DELETE" ]] || {
+        warn "Cancelled."
+        pause
         return
-    fi
+    }
 
-    echo
-    read -rp "Type DELETE to continue: " confirm2
-
-    if [[ "$confirm2" != "DELETE" ]]; then
-        warning "Uninstall cancelled."
-        return
-    fi
-
-    echo
-    msg "Stopping PICASO services..."
-
-    systemctl disable --now picaso-monitor.service \
+    # Stop services
+    systemctl disable --now "$MONITOR_SERVICE" \
         >/dev/null 2>&1 || true
 
-    systemctl disable --now picaso-restore.service \
+    systemctl disable "$RESTORE_SERVICE" \
         >/dev/null 2>&1 || true
 
-    echo
-    msg "Removing GRE tunnels..."
-
-    local file
-    local id
-
-    shopt -s nullglob
-
+    # Remove every tunnel
     for file in "$TUNNEL_DIR"/*.conf; do
 
-        id="$(basename "$file" .conf)"
+        [[ -e "$file" ]] || continue
 
-        load_config "$id" || continue
+        # shellcheck disable=SC1090
+        source "$file"
 
-        firewall_remove "$REMOTE_PUBLIC_IP" "$INTERFACE"
-
-        if interface_exists "$INTERFACE"; then
-            ip link delete "$INTERFACE" 2>/dev/null || true
-        fi
-
-        success "$INTERFACE removed."
-
+        remove_tunnel_firewall "$ID" || true
+        delete_interface "$INTERFACE" || true
     done
 
-    shopt -u nullglob
-
-    echo
-    msg "Removing services..."
-
-    rm -f "$RESTORE_SERVICE"
-    rm -f "$MONITOR_SERVICE"
-
-    rm -f "$RESTORE_BIN"
-    rm -f "$MONITOR_BIN"
+    # Remove systemd files
+    rm -f "/etc/systemd/system/${RESTORE_SERVICE}"
+    rm -f "/etc/systemd/system/${MONITOR_SERVICE}"
 
     systemctl daemon-reload
 
-    echo
-    msg "Removing configuration..."
-
-    rm -rf "$BASE_DIR"
-
-    rm -f "$LOG_FILE"
-
-    echo
-    msg "Removing optimization configuration..."
-
+    # Remove sysctl files
+    rm -f /etc/sysctl.d/99-picaso-forwarding.conf
     rm -f /etc/sysctl.d/99-picaso-bbr.conf
     rm -f /etc/sysctl.d/99-picaso-network.conf
-    rm -f /etc/sysctl.d/99-picaso-forwarding.conf
 
-    systemctl daemon-reload >/dev/null 2>&1 || true
+    # Remove configuration
+    rm -rf "$BASE_DIR"
 
+    # Remove scripts
+    rm -f "$BIN"
+    rm -f "$RESTORE"
+    rm -f "$MONITOR"
+
+    # Remove log
+    rm -f "$LOG_FILE"
+
+    ok "PICASO completely removed."
     echo
-    success "PICASO has been completely removed."
-    echo
-
-    read -rp "Remove the picaso command now? [Y/n]: " remove_bin
-
-    if [[ ! "$remove_bin" =~ ^[Nn]$ ]]; then
-
-        rm -f "$BIN"
-
-        success "PICASO command removed."
-
-    fi
-
-    echo
-    echo "PICASO uninstall completed."
-    echo
+    echo "gre0 and unrelated iptables rules were left untouched."
 
     exit 0
 }
 
-# ------------------------------------------------------------
-# Install manager
-# ------------------------------------------------------------
+# ============================================================
+# INSTALL MANAGER
+# ============================================================
 
 install_manager() {
 
-    mkdir -p "$BASE_DIR"
-    mkdir -p "$TUNNEL_DIR"
+    if [[ "$0" != "$BIN" ]]; then
 
-    touch "$LOG_FILE"
-
-    create_restore_service
-    create_monitor_service
-
-    # Copy current script to manager command.
-    #
-    # When this file is being executed from a temporary location,
-    # the manager section below is still copied.
-
-    if [[ -f "${BASH_SOURCE[0]}" ]]; then
-        cp "${BASH_SOURCE[0]}" "$BIN"
+        cp "$0" "$BIN"
         chmod +x "$BIN"
+
     fi
-
-    success "PICASO manager installed."
 }
 
-# ------------------------------------------------------------
-# Initial installation
-# ------------------------------------------------------------
-
-first_install() {
-
-    require_root
-
-    initialize_picaso
-
-    install_dependencies
-
-    install_manager
-
-    enable_forwarding
-
-    success "PICASO installation completed."
-
-    log_msg "PICASO installed."
-
-    echo
-}
-
-# ------------------------------------------------------------
-# Main menu
-# ------------------------------------------------------------
+# ============================================================
+# MAIN MENU
+# ============================================================
 
 main_menu() {
 
@@ -2006,39 +2010,54 @@ main_menu() {
 
         clear
 
+        echo -e "${CYAN}"
+        echo "=============================================="
+        echo "                 PICASO"
+        echo "          Multi GRE Tunnel Manager"
+        echo "                 v${VERSION}"
+        echo "=============================================="
+        echo -e "${RESET}"
+
         list_tunnels
 
-        echo "  1) Add new connection"
-        echo "  2) Manage a connection"
-        echo "  3) Check all connections"
-        echo "  4) Repair / Synchronize"
-        echo "  5) Server optimization"
-        echo "  6) Logs"
-        echo "  7) Complete uninstall"
-        echo "  0) Exit"
+        echo "----------------------------------------------"
+        echo "1) Add New Connection"
+        echo "2) Manage A Connection"
+        echo "3) Check All Connections"
+        echo "4) Repair / Synchronize"
+        echo "5) Server Optimization"
+        echo "6) Logs"
+        echo "7) Complete Uninstall"
+        echo "0) Exit"
+        echo "----------------------------------------------"
         echo
 
-        read -rp "Select: " choice
+        read -r -p "Select: " choice
 
         case "$choice" in
 
             1)
                 add_tunnel
-                pause_screen
                 ;;
 
             2)
-                select_tunnel
+                echo
+                read -r -p "Tunnel ID: " id
+
+                if tunnel_exists "$id"; then
+                    manage_tunnel "$id"
+                else
+                    error "Tunnel $id not found."
+                    pause
+                fi
                 ;;
 
             3)
                 check_all
-                pause_screen
                 ;;
 
             4)
                 repair_all
-                pause_screen
                 ;;
 
             5)
@@ -2046,33 +2065,7 @@ main_menu() {
                 ;;
 
             6)
-
-                clear
-
-                echo
-                echo "  1) Show last 100 logs"
-                echo "  2) Live logs"
-                echo "  3) Back"
-                echo
-
-                read -rp "Select: " logchoice
-
-                case "$logchoice" in
-
-                    1)
-                        show_logs
-                        pause_screen
-                        ;;
-
-                    2)
-                        live_logs
-                        ;;
-
-                    3)
-                        ;;
-
-                esac
-
+                show_logs
                 ;;
 
             7)
@@ -2081,181 +2074,47 @@ main_menu() {
 
             0)
                 clear
+                echo "PICASO exited."
                 exit 0
                 ;;
 
             *)
-                error "Invalid option."
+                warn "Invalid option."
                 sleep 1
                 ;;
-
         esac
-
     done
 }
 
-# ------------------------------------------------------------
-# Command line support
-# ------------------------------------------------------------
+# ============================================================
+# INTERNAL RESTORE MODE
+# ============================================================
 
-command_mode() {
+if [[ "${1:-}" == "--restore" ]]; then
 
-    local command="${1:-}"
+    require_root
+    require_commands
+    init_dirs
 
-    case "$command" in
+    # Functions needed by restore
+    restore_all
 
-        start)
+    exit 0
+fi
 
-            [[ -n "${2:-}" ]] || die "Usage: picaso start ID"
-
-            start_tunnel "$2"
-
-            ;;
-
-        stop)
-
-            [[ -n "${2:-}" ]] || die "Usage: picaso stop ID"
-
-            stop_tunnel "$2"
-
-            ;;
-
-        restart)
-
-            [[ -n "${2:-}" ]] || die "Usage: picaso restart ID"
-
-            restart_tunnel "$2"
-
-            ;;
-
-        delete)
-
-            [[ -n "${2:-}" ]] || die "Usage: picaso delete ID"
-
-            delete_tunnel "$2"
-
-            ;;
-
-        test)
-
-            [[ -n "${2:-}" ]] || die "Usage: picaso test ID"
-
-            test_tunnel "$2"
-
-            ;;
-
-        details)
-
-            [[ -n "${2:-}" ]] || die "Usage: picaso details ID"
-
-            show_details "$2"
-
-            ;;
-
-        traffic)
-
-            [[ -n "${2:-}" ]] || die "Usage: picaso traffic ID"
-
-            show_traffic "$2"
-
-            ;;
-
-        status)
-
-            list_tunnels
-
-            ;;
-
-        repair)
-
-            repair_all
-
-            ;;
-
-        bbr)
-
-            install_bbr
-
-            ;;
-
-        optimize)
-
-            network_optimization
-
-            ;;
-
-        uninstall)
-
-            uninstall_picaso
-
-            ;;
-
-        version)
-
-            echo "PICASO GRE Manager v$VERSION"
-
-            ;;
-
-        help|-h|--help)
-
-            echo
-            echo "PICASO GRE Manager"
-            echo
-            echo "Usage:"
-            echo
-            echo "  picaso"
-            echo "  picaso status"
-            echo "  picaso start ID"
-            echo "  picaso stop ID"
-            echo "  picaso restart ID"
-            echo "  picaso delete ID"
-            echo "  picaso test ID"
-            echo "  picaso details ID"
-            echo "  picaso traffic ID"
-            echo "  picaso repair"
-            echo "  picaso bbr"
-            echo "  picaso optimize"
-            echo "  picaso uninstall"
-            echo "  picaso version"
-            echo
-
-            ;;
-
-        "")
-
-            main_menu
-
-            ;;
-
-        *)
-
-            error "Unknown command: $command"
-            echo "Run: picaso help"
-            exit 1
-            ;;
-
-    esac
-}
-
-# ------------------------------------------------------------
-# MAIN
-# ------------------------------------------------------------
+# ============================================================
+# INSTALL / START
+# ============================================================
 
 require_root
+require_commands
+init_dirs
 
-if [[ ! -d "$BASE_DIR" ]]; then
-
-    first_install
-
+# Copy manager
+if [[ "$0" != "$BIN" ]]; then
+    install_manager
 fi
 
-initialize_picaso
+install_systemd
 
-if [[ "${1:-}" == "--install" ]]; then
-
-    first_install
-    exit 0
-
-fi
-
-command_mode "${1:-}" "${2:-}"
+main_menu
