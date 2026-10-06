@@ -985,9 +985,7 @@ remove_port() {
         return 0
 
 
-    sed -i \
-        "\#^${proto}|${public_port}|${destination_port}$#d" \
-        "$PORTS/${id}.rules"
+    sed -i "\#^${proto}|${public_port}|${destination_port}$#d" "$PORTS/${id}.rules"
 
 
     flush_port_rules "$id"
